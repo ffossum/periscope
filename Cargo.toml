@@ -1,0 +1,11 @@
+[package]
+name = "periscope"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.0", features = ["derive"] }
+crossterm = "0.29.0"
+octocrab = "0.49.7"
+ratatui = "0.30.0"
+tokio = { version = "1.51.1", features = ["full"] }
