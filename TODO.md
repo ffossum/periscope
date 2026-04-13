@@ -3,7 +3,7 @@
 ## Foundation
 - [x] Initialize Rust project with dependencies
   (ratatui, crossterm, tokio, octocrab)
-- [ ] Set up basic TUI framework (terminal init/restore, event loop, app state)
+- [x] Set up basic TUI framework (terminal init/restore, event loop, app state)
 - [ ] Add configuration for GitHub token and enterprise URL
 
 ## PR List
