@@ -1,14 +1,11 @@
 # TODOs
 
 ## Foundation
-- [x] Initialize Rust project with dependencies
-  (ratatui, crossterm, tokio, octocrab)
+- [x] Initialize Rust project with dependencies (ratatui, crossterm, tokio, clap, gh cli)
 - [x] Set up basic TUI framework (terminal init/restore, event loop, app state)
-- [ ] Add configuration for GitHub token and enterprise URL
 
 ## PR List
-- [ ] Authenticate with the GitHub (Enterprise) instance
-- [ ] Fetch the list of PRs currently assigned to the user
+- [ ] Fetch the list of PRs currently assigned to the user (via `gh`)
 - [ ] Display PRs in a navigable list view
 
 ## PR Detail
