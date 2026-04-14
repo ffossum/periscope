@@ -1,4 +1,5 @@
 mod app;
+mod github;
 mod ui;
 
 use app::App;
@@ -7,8 +8,9 @@ use app::App;
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
+    let mut app = App::new().await?;
     let mut terminal = ratatui::init();
-    let result = App::new().run(&mut terminal).await;
+    let result = app.run(&mut terminal).await;
     ratatui::restore();
 
     result

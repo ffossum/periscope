@@ -5,8 +5,8 @@
 - [x] Set up basic TUI framework (terminal init/restore, event loop, app state)
 
 ## PR List
-- [ ] Fetch the list of PRs currently assigned to the user (via `gh`)
-- [ ] Display PRs in a navigable list view
+- [x] Fetch the list of PRs currently assigned to the user (via `gh`)
+- [x] Display PRs in a navigable list view
 
 ## PR Detail
 - [ ] Display PR metadata (title, description, author, status)
