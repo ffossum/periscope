@@ -2,9 +2,11 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -27,6 +29,8 @@ pub fn read_input(file: Option<PathBuf>) -> color_eyre::Result<String> {
 const NUM_WIDTH: usize = 4;
 /// Tabs are expanded to this many spaces so columns stay aligned.
 const TAB_WIDTH: usize = 4;
+/// Blank rows between adjacent file blocks.
+const FILE_GAP: u16 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
 enum SideKind {
@@ -48,9 +52,9 @@ struct SideLine {
     kind: SideKind,
 }
 
-/// A single rendered row of the viewer.
+/// A single content row within a file block.
 enum Row {
-    /// A full-width line: file metadata or a hunk header.
+    /// A full-width line, e.g. a hunk header.
     Full(String, Style),
     /// A pair of cells shown side by side. Either side may be empty.
     Pair {
@@ -59,9 +63,23 @@ enum Row {
     },
 }
 
+/// One file's diff: a titled, bordered block of rows.
+#[derive(Default)]
+struct FileDiff {
+    title: String,
+    rows: Vec<Row>,
+}
+
+impl FileDiff {
+    /// Total rendered height including the top and bottom borders.
+    fn height(&self) -> u16 {
+        (self.rows.len() as u16).saturating_add(2)
+    }
+}
+
 pub struct DiffViewer {
     running: bool,
-    rows: Vec<Row>,
+    files: Vec<FileDiff>,
     scroll: u16,
     viewport_height: u16,
 }
@@ -70,7 +88,7 @@ impl DiffViewer {
     pub fn new(raw: &str) -> Self {
         Self {
             running: true,
-            rows: parse(raw),
+            files: parse(raw),
             scroll: 0,
             viewport_height: 0,
         }
@@ -93,29 +111,49 @@ impl DiffViewer {
 
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        // Account for the top and bottom border rows.
-        self.viewport_height = area.height.saturating_sub(2);
+        self.viewport_height = area.height;
         self.clamp_scroll();
 
-        let total = self.rows.len();
-        let current = (self.scroll as usize + 1).min(total.max(1));
-        let title = format!(" diff — {current}/{total} ");
+        if area.width < 3 || area.height == 0 {
+            return;
+        }
 
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+        let scroll = self.scroll as i32;
+        let viewport = area.height as i32;
+        let width = area.width;
+        let buf = frame.buffer_mut();
 
-        // The inner width excludes the two vertical border columns.
-        let inner_width = area.width.saturating_sub(2) as usize;
-        let lines: Vec<Line> = self
-            .rows
-            .iter()
-            .map(|row| render_row(row, inner_width))
-            .collect();
+        // Virtual top of the current file in the full stacked layout.
+        let mut top = 0i32;
+        for file in &self.files {
+            let block_h = file.height();
+            let screen_top = top - scroll;
 
-        let paragraph = Paragraph::new(lines).block(block).scroll((self.scroll, 0));
-        frame.render_widget(paragraph, area);
+            // Render and blit only files intersecting the viewport.
+            if screen_top < viewport && screen_top + block_h as i32 > 0 {
+                let tmp = render_file(file, width);
+                for r in 0..tmp.area.height {
+                    let sy = screen_top + r as i32;
+                    if sy < 0 || sy >= viewport {
+                        continue;
+                    }
+                    let dst_y = area.y + sy as u16;
+                    for x in 0..width {
+                        if let Some(src) = tmp.cell((x, r)) {
+                            let src = src.clone();
+                            if let Some(dst) = buf.cell_mut((area.x + x, dst_y)) {
+                                *dst = src;
+                            }
+                        }
+                    }
+                }
+            }
+
+            top += block_h as i32 + FILE_GAP as i32;
+            if top - scroll >= viewport {
+                break; // everything below is off-screen
+            }
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -142,14 +180,47 @@ impl DiffViewer {
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
+    fn total_height(&self) -> u16 {
+        let mut total: u32 = 0;
+        for (i, file) in self.files.iter().enumerate() {
+            total += file.height() as u32;
+            if i + 1 < self.files.len() {
+                total += FILE_GAP as u32;
+            }
+        }
+        total.min(u16::MAX as u32) as u16
+    }
+
     fn max_scroll(&self) -> u16 {
-        let total = self.rows.len() as u16;
-        total.saturating_sub(self.viewport_height)
+        self.total_height().saturating_sub(self.viewport_height)
     }
 }
 
-/// Parse a unified diff into side-by-side rows with syntax highlighting.
-fn parse(raw: &str) -> Vec<Row> {
+/// Render one file block into its own buffer, sized to fit the whole block.
+fn render_file(file: &FileDiff, width: u16) -> Buffer {
+    let rect = Rect::new(0, 0, width, file.height());
+    let mut buf = Buffer::empty(rect);
+
+    let block = Block::default()
+        .title(format!(" {} ", file.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(rect);
+    block.render(rect, &mut buf);
+
+    let inner_w = inner.width as usize;
+    let lines: Vec<Line> = file
+        .rows
+        .iter()
+        .map(|row| render_row(row, inner_w))
+        .collect();
+    Paragraph::new(lines).render(inner, &mut buf);
+
+    buf
+}
+
+/// Parse a unified diff into per-file groups with syntax highlighting.
+fn parse(raw: &str) -> Vec<FileDiff> {
     let syntaxes = SyntaxSet::load_defaults_newlines();
     let mut themes = ThemeSet::load_defaults();
     let theme = themes
@@ -158,7 +229,8 @@ fn parse(raw: &str) -> Vec<Row> {
         .or_else(|| themes.themes.values().next().cloned())
         .expect("syntect ships at least one default theme");
 
-    let mut rows = Vec::new();
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut cur: Option<FileDiff> = None;
     // Buffered runs of removed/added lines, paired when the run ends.
     let mut removed: Vec<SideLine> = Vec::new();
     let mut added: Vec<SideLine> = Vec::new();
@@ -183,30 +255,57 @@ fn parse(raw: &str) -> Vec<Row> {
     };
 
     for line in raw.lines() {
-        if line.starts_with("@@") {
-            flush(&mut rows, &mut removed, &mut added);
-            (old_ln, new_ln) = parse_hunk_header(line);
-            in_hunk = true;
-            old_hl = syntax.map(|s| HighlightLines::new(s, &theme));
-            new_hl = syntax.map(|s| HighlightLines::new(s, &theme));
-            rows.push(Row::Full(line.to_string(), hunk_style()));
+        if line.starts_with("diff --git") {
+            if let Some(f) = cur.as_mut() {
+                flush(&mut f.rows, &mut removed, &mut added);
+            }
+            files.extend(cur.take());
+            cur = Some(FileDiff {
+                title: title_from_diff_git(line),
+                rows: Vec::new(),
+            });
+            syntax = None;
+            in_hunk = false;
+            old_hl = None;
+            new_hl = None;
             continue;
         }
 
         if is_file_meta(line) {
-            flush(&mut rows, &mut removed, &mut added);
-            in_hunk = false;
-            if line.starts_with("diff --git") {
-                syntax = None;
-            } else if let Some(rest) = line.strip_prefix("+++ ") {
-                syntax = syntax_for_path(&syntaxes, rest);
+            if let Some(f) = cur.as_mut() {
+                flush(&mut f.rows, &mut removed, &mut added);
             }
-            rows.push(Row::Full(line.to_string(), header_style()));
+            in_hunk = false;
+            // Use the +++/--- paths to pick a syntax and refine the title.
+            if let Some(rest) = line.strip_prefix("+++ ").or_else(|| line.strip_prefix("--- ")) {
+                if let Some(s) = syntax_for_path(&syntaxes, rest) {
+                    syntax = Some(s);
+                }
+                if let Some(path) = clean_path(rest) {
+                    let file = cur.get_or_insert_with(FileDiff::default);
+                    if line.starts_with("+++ ") || file.title.is_empty() {
+                        file.title = path;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            let file = cur.get_or_insert_with(FileDiff::default);
+            flush(&mut file.rows, &mut removed, &mut added);
+            (old_ln, new_ln) = parse_hunk_header(line);
+            in_hunk = true;
+            old_hl = syntax.map(|s| HighlightLines::new(s, &theme));
+            new_hl = syntax.map(|s| HighlightLines::new(s, &theme));
+            file.rows.push(Row::Full(line.to_string(), hunk_style()));
             continue;
         }
 
         if !in_hunk {
-            rows.push(Row::Full(line.to_string(), Style::default()));
+            // Stray content (e.g. non-diff input): show it verbatim.
+            let file = cur.get_or_insert_with(FileDiff::default);
+            file.rows.push(Row::Full(line.to_string(), Style::default()));
             continue;
         }
 
@@ -232,11 +331,12 @@ fn parse(raw: &str) -> Vec<Row> {
             Some('\\') => {} // "\ No newline at end of file"
             _ => {
                 // Context line (leading space, or an empty line).
-                flush(&mut rows, &mut removed, &mut added);
+                let file = cur.get_or_insert_with(FileDiff::default);
+                flush(&mut file.rows, &mut removed, &mut added);
                 let text = expand_tabs(line.strip_prefix(' ').unwrap_or(line));
                 let left = highlight(&mut old_hl, &syntaxes, &text);
                 let right = highlight(&mut new_hl, &syntaxes, &text);
-                rows.push(Row::Pair {
+                file.rows.push(Row::Pair {
                     left: Some(SideLine {
                         num: old_ln,
                         segs: left,
@@ -254,8 +354,11 @@ fn parse(raw: &str) -> Vec<Row> {
         }
     }
 
-    flush(&mut rows, &mut removed, &mut added);
-    rows
+    if let Some(f) = cur.as_mut() {
+        flush(&mut f.rows, &mut removed, &mut added);
+    }
+    files.extend(cur);
+    files
 }
 
 /// Highlight one already-tab-expanded line into colored segments.
@@ -385,24 +488,34 @@ fn expand_tabs(s: &str) -> String {
     s.replace('\t', &" ".repeat(TAB_WIDTH))
 }
 
-/// Look up a syntax for a diff path like `b/src/main.rs`.
-fn syntax_for_path<'a>(syntaxes: &'a SyntaxSet, raw_path: &str) -> Option<&'a SyntaxReference> {
-    let path = raw_path.trim();
+/// Strip the leading `a/` or `b/` from a diff path, or `None` for `/dev/null`.
+fn clean_path(raw: &str) -> Option<String> {
+    let path = raw.trim();
     let path = path
         .strip_prefix("b/")
         .or_else(|| path.strip_prefix("a/"))
         .unwrap_or(path);
-    if path == "/dev/null" {
-        return None;
-    }
-    let ext = Path::new(path).extension()?.to_str()?;
+    (path != "/dev/null").then(|| path.to_string())
+}
+
+/// Look up a syntax for a diff path like `b/src/main.rs`.
+fn syntax_for_path<'a>(syntaxes: &'a SyntaxSet, raw_path: &str) -> Option<&'a SyntaxReference> {
+    let path = clean_path(raw_path)?;
+    let ext = Path::new(&path).extension()?.to_str()?;
     syntaxes.find_syntax_by_extension(ext)
+}
+
+/// Pull the new-file path out of a `diff --git a/<path> b/<path>` line.
+fn title_from_diff_git(line: &str) -> String {
+    line.split_whitespace()
+        .last()
+        .map(|t| t.strip_prefix("b/").unwrap_or(t).to_string())
+        .unwrap_or_default()
 }
 
 /// Whether a line is file-level metadata (not part of a hunk body).
 fn is_file_meta(line: &str) -> bool {
-    const PREFIXES: [&str; 10] = [
-        "diff --git",
+    const PREFIXES: [&str; 9] = [
         "index ",
         "--- ",
         "+++ ",
@@ -436,12 +549,6 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
         }
     }
     (old, new)
-}
-
-fn header_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
 }
 
 fn hunk_style() -> Style {
