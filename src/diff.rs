@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
-use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
@@ -120,39 +119,55 @@ impl DiffViewer {
 
         let scroll = self.scroll as i32;
         let viewport = area.height as i32;
-        let width = area.width;
-        let buf = frame.buffer_mut();
+        let border_style = Style::default().fg(Color::Cyan);
 
         // Virtual top of the current file in the full stacked layout.
         let mut top = 0i32;
         for file in &self.files {
-            let block_h = file.height();
+            let block_h = file.height() as i32;
             let screen_top = top - scroll;
+            top += block_h + FILE_GAP as i32;
 
-            // Render and blit only files intersecting the viewport.
-            if screen_top < viewport && screen_top + block_h as i32 > 0 {
-                let tmp = render_file(file, width);
-                for r in 0..tmp.area.height {
-                    let sy = screen_top + r as i32;
-                    if sy < 0 || sy >= viewport {
-                        continue;
-                    }
-                    let dst_y = area.y + sy as u16;
-                    for x in 0..width {
-                        if let Some(src) = tmp.cell((x, r)) {
-                            let src = src.clone();
-                            if let Some(dst) = buf.cell_mut((area.x + x, dst_y)) {
-                                *dst = src;
-                            }
-                        }
-                    }
-                }
+            if screen_top >= viewport {
+                break; // this file and everything after is below the viewport
+            }
+            // The block's on-screen row span, clipped to the viewport.
+            let vis0 = screen_top.max(0);
+            let vis1 = (screen_top + block_h).min(viewport);
+            if vis1 <= vis0 {
+                continue; // fully above the viewport
             }
 
-            top += block_h as i32 + FILE_GAP as i32;
-            if top - scroll >= viewport {
-                break; // everything below is off-screen
+            // A border is drawn only when its row is actually on-screen, so a
+            // box clipped at a screen edge shows no border there.
+            let local_start = vis0 - screen_top;
+            let local_end = vis1 - screen_top;
+            let mut borders = Borders::LEFT | Borders::RIGHT;
+            if local_start == 0 {
+                borders |= Borders::TOP;
             }
+            if local_end == block_h {
+                borders |= Borders::BOTTOM;
+            }
+
+            let mut block = Block::default().borders(borders).border_style(border_style);
+            if borders.contains(Borders::TOP) {
+                block = block.title(format!(" {} ", file.title));
+            }
+
+            let rect = Rect::new(area.x, area.y + vis0 as u16, area.width, (vis1 - vis0) as u16);
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+
+            // Render only the content rows visible inside the borders.
+            let first = local_start.max(1) - 1;
+            let last = local_end.min(block_h - 1) - 1;
+            let inner_w = inner.width as usize;
+            let lines: Vec<Line> = file.rows[first as usize..last as usize]
+                .iter()
+                .map(|row| render_row(row, inner_w))
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner);
         }
     }
 
@@ -194,29 +209,6 @@ impl DiffViewer {
     fn max_scroll(&self) -> u16 {
         self.total_height().saturating_sub(self.viewport_height)
     }
-}
-
-/// Render one file block into its own buffer, sized to fit the whole block.
-fn render_file(file: &FileDiff, width: u16) -> Buffer {
-    let rect = Rect::new(0, 0, width, file.height());
-    let mut buf = Buffer::empty(rect);
-
-    let block = Block::default()
-        .title(format!(" {} ", file.title))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(rect);
-    block.render(rect, &mut buf);
-
-    let inner_w = inner.width as usize;
-    let lines: Vec<Line> = file
-        .rows
-        .iter()
-        .map(|row| render_row(row, inner_w))
-        .collect();
-    Paragraph::new(lines).render(inner, &mut buf);
-
-    buf
 }
 
 /// Parse a unified diff into per-file groups with syntax highlighting.
