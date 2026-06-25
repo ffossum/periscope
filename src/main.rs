@@ -23,6 +23,10 @@ async fn main() -> color_eyre::Result<()> {
 
 async fn run_diff(file: Option<std::path::PathBuf>) -> color_eyre::Result<()> {
     let raw = diff::read_input(file)?;
+    // Nothing to show (e.g. `git diff` with no changes): exit without a TUI.
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
     // crossterm reads key events from /dev/tty directly, so a piped-in diff on
     // stdin (`git diff | periscope diff`) doesn't interfere with the event loop.
     let mut viewer = DiffViewer::new(&raw);
