@@ -32,10 +32,10 @@ impl App {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
 
-            if let Some(Ok(Event::Key(key))) = reader.next().await {
-                if key.kind == KeyEventKind::Press {
-                    self.handle_key(key);
-                }
+            if let Some(Ok(Event::Key(key))) = reader.next().await
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key);
             }
         }
         Ok(())

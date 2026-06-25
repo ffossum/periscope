@@ -11,11 +11,16 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Read the diff from `file`, or from stdin when no file is given.
+///
+/// Strips ANSI escapes so the diff parses cleanly when used as git's
+/// `pager.diff`, where git colorizes the stream it pipes in. periscope does its
+/// own syntax highlighting, so git's coloring is just noise here.
 pub fn read_input(file: Option<PathBuf>) -> color_eyre::Result<String> {
-    match file {
-        Some(path) => Ok(std::fs::read_to_string(path)?),
-        None => Ok(std::io::read_to_string(std::io::stdin())?),
-    }
+    let raw = match file {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => std::io::read_to_string(std::io::stdin())?,
+    };
+    Ok(strip_ansi_escapes::strip_str(&raw))
 }
 
 /// Width of the gutter holding a line number (plus one space) on each side.
@@ -77,10 +82,10 @@ impl DiffViewer {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
 
-            if let Some(Ok(Event::Key(key))) = reader.next().await {
-                if key.kind == KeyEventKind::Press {
-                    self.handle_key(key);
-                }
+            if let Some(Ok(Event::Key(key))) = reader.next().await
+                && key.kind == KeyEventKind::Press
+            {
+                self.handle_key(key);
             }
         }
         Ok(())
