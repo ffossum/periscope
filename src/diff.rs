@@ -7,6 +7,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
@@ -49,6 +50,9 @@ struct SideLine {
     num: usize,
     segs: Vec<Seg>,
     kind: SideKind,
+    /// Per-content-char mask of intra-line changes (empty = nothing emphasized).
+    /// Indexed by char position across the concatenated `segs` text.
+    emph: Vec<bool>,
 }
 
 /// A single content row within a file block.
@@ -119,7 +123,7 @@ impl DiffViewer {
 
         let scroll = self.scroll as i32;
         let viewport = area.height as i32;
-        let border_style = Style::default().fg(Color::Cyan);
+        let border_style = Style::default().fg(Color::Gray);
 
         // Virtual top of the current file in the full stacked layout.
         let mut top = 0i32;
@@ -155,7 +159,12 @@ impl DiffViewer {
                 block = block.title(format!(" {} ", file.title));
             }
 
-            let rect = Rect::new(area.x, area.y + vis0 as u16, area.width, (vis1 - vis0) as u16);
+            let rect = Rect::new(
+                area.x,
+                area.y + vis0 as u16,
+                area.width,
+                (vis1 - vis0) as u16,
+            );
             let inner = block.inner(rect);
             frame.render_widget(block, rect);
 
@@ -239,10 +248,12 @@ fn parse(raw: &str) -> Vec<FileDiff> {
         let mut rem = removed.drain(..);
         let mut add = added.drain(..);
         for _ in 0..pairs {
-            rows.push(Row::Pair {
-                left: rem.next(),
-                right: add.next(),
-            });
+            let mut left = rem.next();
+            let mut right = add.next();
+            if let (Some(l), Some(r)) = (left.as_mut(), right.as_mut()) {
+                mark_intra_line(l, r);
+            }
+            rows.push(Row::Pair { left, right });
         }
     };
 
@@ -269,7 +280,10 @@ fn parse(raw: &str) -> Vec<FileDiff> {
             }
             in_hunk = false;
             // Use the +++/--- paths to pick a syntax and refine the title.
-            if let Some(rest) = line.strip_prefix("+++ ").or_else(|| line.strip_prefix("--- ")) {
+            if let Some(rest) = line
+                .strip_prefix("+++ ")
+                .or_else(|| line.strip_prefix("--- "))
+            {
                 if let Some(s) = syntax_for_path(&syntaxes, rest) {
                     syntax = Some(s);
                 }
@@ -297,7 +311,8 @@ fn parse(raw: &str) -> Vec<FileDiff> {
         if !in_hunk {
             // Stray content (e.g. non-diff input): show it verbatim.
             let file = cur.get_or_insert_with(FileDiff::default);
-            file.rows.push(Row::Full(line.to_string(), Style::default()));
+            file.rows
+                .push(Row::Full(line.to_string(), Style::default()));
             continue;
         }
 
@@ -308,6 +323,7 @@ fn parse(raw: &str) -> Vec<FileDiff> {
                     num: new_ln,
                     segs,
                     kind: SideKind::Added,
+                    emph: Vec::new(),
                 });
                 new_ln += 1;
             }
@@ -317,6 +333,7 @@ fn parse(raw: &str) -> Vec<FileDiff> {
                     num: old_ln,
                     segs,
                     kind: SideKind::Removed,
+                    emph: Vec::new(),
                 });
                 old_ln += 1;
             }
@@ -333,11 +350,13 @@ fn parse(raw: &str) -> Vec<FileDiff> {
                         num: old_ln,
                         segs: left,
                         kind: SideKind::Context,
+                        emph: Vec::new(),
                     }),
                     right: Some(SideLine {
                         num: new_ln,
                         segs: right,
                         kind: SideKind::Context,
+                        emph: Vec::new(),
                     }),
                 });
                 old_ln += 1;
@@ -387,6 +406,45 @@ fn highlight(hl: &mut Option<HighlightLines>, syntaxes: &SyntaxSet, text: &str) 
     }
 }
 
+/// Compute character-level changes between a paired removed/added line and
+/// store the result as a per-char mask on each side.
+///
+/// Skipped when the two lines are too dissimilar (a near-total rewrite), where
+/// emphasizing nearly every character would just be noise on top of the
+/// add/remove line background.
+fn mark_intra_line(left: &mut SideLine, right: &mut SideLine) {
+    let old: String = left.segs.iter().map(|s| s.text.as_str()).collect();
+    let new: String = right.segs.iter().map(|s| s.text.as_str()).collect();
+
+    let diff = TextDiff::from_chars(&old, &new);
+    if diff.ratio() < 0.5 {
+        return;
+    }
+
+    let mut lmask = vec![false; old.chars().count()];
+    let mut rmask = vec![false; new.chars().count()];
+    let (mut li, mut ri) = (0usize, 0usize);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                li += 1;
+                ri += 1;
+            }
+            ChangeTag::Delete => {
+                lmask[li] = true;
+                li += 1;
+            }
+            ChangeTag::Insert => {
+                rmask[ri] = true;
+                ri += 1;
+            }
+        }
+    }
+
+    left.emph = lmask;
+    right.emph = rmask;
+}
+
 /// Render a row to a single full-width `Line`, split into two columns.
 fn render_row(row: &Row, width: usize) -> Line<'static> {
     match row {
@@ -398,7 +456,10 @@ fn render_row(row: &Row, width: usize) -> Line<'static> {
             let right_w = avail - left_w;
 
             let mut spans = cell_spans(left.as_ref(), left_w);
-            spans.push(Span::styled("│".to_string(), Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "│".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
             spans.extend(cell_spans(right.as_ref(), right_w));
             Line::from(spans)
         }
@@ -411,10 +472,12 @@ fn cell_spans(side: Option<&SideLine>, width: usize) -> Vec<Span<'static>> {
         return vec![Span::raw(" ".repeat(width))];
     };
 
-    let bg = match s.kind {
-        SideKind::Removed => Some(Color::Rgb(60, 30, 30)),
-        SideKind::Added => Some(Color::Rgb(25, 50, 30)),
-        SideKind::Context => None,
+    // `bg` paints the whole cell; `emph_bg` highlights chars that changed
+    // relative to the paired line on the other side.
+    let (bg, emph_bg) = match s.kind {
+        SideKind::Removed => (Some(Color::Rgb(60, 30, 30)), Some(Color::Rgb(110, 45, 45))),
+        SideKind::Added => (Some(Color::Rgb(25, 50, 30)), Some(Color::Rgb(35, 95, 50))),
+        SideKind::Context => (None, None),
     };
     let marker = match s.kind {
         SideKind::Removed => '-',
@@ -428,15 +491,39 @@ fn cell_spans(side: Option<&SideLine>, width: usize) -> Vec<Span<'static>> {
     };
 
     let base = bg.map_or_else(Style::default, |b| Style::default().bg(b));
+    let emph = emph_bg.map_or(base, |b| base.bg(b));
 
     let gutter = format!("{:>NUM_WIDTH$} {marker}", s.num);
     let mut spans = vec![Span::styled(gutter, base.fg(gutter_fg))];
+
+    // Walk segs and the change mask together, breaking each syntax run wherever
+    // emphasis toggles so changed character spans get the brighter background.
+    let mut ci = 0usize;
     for seg in &s.segs {
-        let style = match seg.fg {
+        let plain = match seg.fg {
             Some(fg) => base.fg(fg),
             None => base,
         };
-        spans.push(Span::styled(seg.text.clone(), style));
+        let lit = match seg.fg {
+            Some(fg) => emph.fg(fg),
+            None => emph,
+        };
+        let mut run = String::new();
+        let mut run_emph = false;
+        for ch in seg.text.chars() {
+            let e = s.emph.get(ci).copied().unwrap_or(false);
+            if !run.is_empty() && e != run_emph {
+                let style = if run_emph { lit } else { plain };
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+            }
+            run.push(ch);
+            run_emph = e;
+            ci += 1;
+        }
+        if !run.is_empty() {
+            let style = if run_emph { lit } else { plain };
+            spans.push(Span::styled(run, style));
+        }
     }
     fit_spans(spans, width, base)
 }
@@ -525,19 +612,19 @@ fn is_file_meta(line: &str) -> bool {
 fn parse_hunk_header(line: &str) -> (usize, usize) {
     let mut old = 1;
     let mut new = 1;
-    for token in line.split_whitespace() {
+    // Only the range section between the `@@` markers holds the numbers; the
+    // trailing function context can contain stray `+`/`-` tokens (e.g. Rust's
+    // `->`) that must not be mistaken for line numbers.
+    let range = line.split("@@").nth(1).unwrap_or(line);
+    for token in range.split_whitespace() {
         if let Some(rest) = token.strip_prefix('-') {
-            old = rest
-                .split(',')
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(1);
+            if let Some(n) = rest.split(',').next().and_then(|n| n.parse().ok()) {
+                old = n;
+            }
         } else if let Some(rest) = token.strip_prefix('+') {
-            new = rest
-                .split(',')
-                .next()
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(1);
+            if let Some(n) = rest.split(',').next().and_then(|n| n.parse().ok()) {
+                new = n;
+            }
         }
     }
     (old, new)
