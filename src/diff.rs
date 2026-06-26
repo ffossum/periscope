@@ -271,7 +271,8 @@ fn parse(raw: &str) -> Vec<ParsedFile> {
         if is_file_meta(line) {
             in_hunk = false;
             if let Some(rest) = line.strip_prefix("rename from ") {
-                cur.get_or_insert_with(ParsedFile::default).rename_from = Some(rest.trim().to_string());
+                cur.get_or_insert_with(ParsedFile::default).rename_from =
+                    Some(rest.trim().to_string());
             } else if let Some(rest) = line.strip_prefix("rename to ") {
                 cur.get_or_insert_with(ParsedFile::default).title = rest.trim().to_string();
             } else if let Some(rest) = line
@@ -395,7 +396,11 @@ fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff
                 flush(&mut rows, &mut removed, &mut added);
                 old_hl = syntax.map(|s| HighlightLines::new(s, theme));
                 new_hl = syntax.map(|s| HighlightLines::new(s, theme));
+                // Pad the hunk header with a blank row above and below, sharing
+                // the header's style so it reads as one band.
+                rows.push(blank_row(hunk_style()));
                 rows.push(Row::Full(text, hunk_style()));
+                rows.push(blank_row(hunk_style()));
             }
             ParsedRow::Verbatim(text) => {
                 flush(&mut rows, &mut removed, &mut added);
@@ -721,7 +726,13 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
 }
 
 fn hunk_style() -> Style {
-    Style::default().fg(Color::Cyan)
+    // #253143
+    Style::default().fg(Color::Gray).bg(Color::Rgb(40, 40, 60))
+}
+
+/// A blank full-width padding row in the given style.
+fn blank_row(style: Style) -> Row {
+    Row::Full(String::new(), style)
 }
 
 #[cfg(test)]
