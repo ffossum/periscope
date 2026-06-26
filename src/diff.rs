@@ -239,7 +239,10 @@ enum ParsedRow {
 /// One file's diff as plain data, before syntax highlighting and pairing.
 #[derive(Default)]
 struct ParsedFile {
+    /// The current (new) path; becomes the block title.
     title: String,
+    /// The previous path when the file was renamed, else `None`.
+    rename_from: Option<String>,
     rows: Vec<ParsedRow>,
 }
 
@@ -259,7 +262,7 @@ fn parse(raw: &str) -> Vec<ParsedFile> {
             files.extend(cur.take());
             cur = Some(ParsedFile {
                 title: title_from_diff_git(line),
-                rows: Vec::new(),
+                ..ParsedFile::default()
             });
             in_hunk = false;
             continue;
@@ -267,12 +270,16 @@ fn parse(raw: &str) -> Vec<ParsedFile> {
 
         if is_file_meta(line) {
             in_hunk = false;
-            // Use the +++/--- paths to refine the title.
-            if let Some(rest) = line
+            if let Some(rest) = line.strip_prefix("rename from ") {
+                cur.get_or_insert_with(ParsedFile::default).rename_from = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("rename to ") {
+                cur.get_or_insert_with(ParsedFile::default).title = rest.trim().to_string();
+            } else if let Some(rest) = line
                 .strip_prefix("+++ ")
                 .or_else(|| line.strip_prefix("--- "))
                 && let Some(path) = clean_path(rest)
             {
+                // Use the +++/--- paths to refine the title.
                 let file = cur.get_or_insert_with(ParsedFile::default);
                 if line.starts_with("+++ ") || file.title.is_empty() {
                     file.title = path;
@@ -355,6 +362,11 @@ fn build_files(parsed: Vec<ParsedFile>) -> Vec<FileDiff> {
 /// Build one file's renderable rows from its parsed form.
 fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff {
     let syntax = syntax_for_title(syntaxes, &file.title);
+    // Show renames as `old → new`; otherwise just the path.
+    let title = match &file.rename_from {
+        Some(from) if *from != file.title => format!("{from} → {}", file.title),
+        _ => file.title.clone(),
+    };
     let mut rows: Vec<Row> = Vec::new();
     // Buffered runs of removed/added lines, paired when the run ends.
     let mut removed: Vec<SideLine> = Vec::new();
@@ -446,10 +458,7 @@ fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff
     }
 
     flush(&mut rows, &mut removed, &mut added);
-    FileDiff {
-        title: file.title,
-        rows,
-    }
+    FileDiff { title, rows }
 }
 
 /// Highlight one already-tab-expanded line into colored segments.
@@ -784,6 +793,25 @@ diff --git a/gone.rs b/gone.rs
 ";
         let files = parse(raw);
         assert_eq!(files[0].title, "gone.rs");
+    }
+
+    #[test]
+    fn rename_title_shows_arrow() {
+        let raw = "\
+diff --git a/old/name.rs b/new/name.rs
+similarity index 92%
+rename from old/name.rs
+rename to new/name.rs
+--- a/old/name.rs
++++ b/new/name.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let parsed = parse(raw);
+        assert_eq!(parsed[0].rename_from.as_deref(), Some("old/name.rs"));
+        assert_eq!(parsed[0].title, "new/name.rs");
+        assert_eq!(build_files(parsed)[0].title, "old/name.rs → new/name.rs");
     }
 
     #[test]
