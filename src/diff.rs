@@ -496,11 +496,13 @@ fn mark_intra_line(left: &mut SideLine, right: &mut SideLine) {
     let old: String = left.segs.iter().map(|s| s.text.as_str()).collect();
     let new: String = right.segs.iter().map(|s| s.text.as_str()).collect();
 
-    let diff = TextDiff::from_chars(&old, &new);
-    if diff.ratio() < 0.5 {
+    // Gauge similarity on the content alone: shared leading indentation
+    // shouldn't make an otherwise-complete rewrite look similar enough to mark.
+    if TextDiff::from_chars(old.trim_start(), new.trim_start()).ratio() < 0.5 {
         return;
     }
 
+    let diff = TextDiff::from_chars(&old, &new);
     let mut lmask = vec![false; old.chars().count()];
     let mut rmask = vec![false; new.chars().count()];
     let (mut li, mut ri) = (0usize, 0usize);
