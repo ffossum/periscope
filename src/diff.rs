@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Read the diff from `file`, or from stdin when no file is given.
@@ -32,7 +32,7 @@ const TAB_WIDTH: usize = 4;
 /// Blank rows between adjacent file blocks.
 const FILE_GAP: u16 = 1;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SideKind {
     Context,
     Removed,
@@ -91,7 +91,7 @@ impl DiffViewer {
     pub fn new(raw: &str) -> Self {
         Self {
             running: true,
-            files: parse(raw),
+            files: build_files(parse(raw)),
             scroll: 0,
             viewport_height: 0,
         }
@@ -220,8 +220,124 @@ impl DiffViewer {
     }
 }
 
-/// Parse a unified diff into per-file groups with syntax highlighting.
-fn parse(raw: &str) -> Vec<FileDiff> {
+/// A single parsed line of a diff, before any styling or pairing.
+enum ParsedRow {
+    /// A hunk header (`@@ ... @@`).
+    Hunk(String),
+    /// A line shown verbatim full-width: file metadata or stray non-diff input.
+    Verbatim(String),
+    /// A content line tagged with its role and 1-based line numbers. `old` is
+    /// set for removed/context lines, `new` for added/context lines.
+    Content {
+        kind: SideKind,
+        old: Option<usize>,
+        new: Option<usize>,
+        text: String,
+    },
+}
+
+/// One file's diff as plain data, before syntax highlighting and pairing.
+#[derive(Default)]
+struct ParsedFile {
+    title: String,
+    rows: Vec<ParsedRow>,
+}
+
+/// Parse a unified diff into per-file groups of plain, unstyled rows.
+///
+/// This step is pure text-to-data: no syntax highlighting, no side-by-side
+/// pairing, no styling. Those happen in [`build_files`].
+fn parse(raw: &str) -> Vec<ParsedFile> {
+    let mut files: Vec<ParsedFile> = Vec::new();
+    let mut cur: Option<ParsedFile> = None;
+    let mut old_ln = 0usize;
+    let mut new_ln = 0usize;
+    let mut in_hunk = false;
+
+    for line in raw.lines() {
+        if line.starts_with("diff --git") {
+            files.extend(cur.take());
+            cur = Some(ParsedFile {
+                title: title_from_diff_git(line),
+                rows: Vec::new(),
+            });
+            in_hunk = false;
+            continue;
+        }
+
+        if is_file_meta(line) {
+            in_hunk = false;
+            // Use the +++/--- paths to refine the title.
+            if let Some(rest) = line
+                .strip_prefix("+++ ")
+                .or_else(|| line.strip_prefix("--- "))
+                && let Some(path) = clean_path(rest)
+            {
+                let file = cur.get_or_insert_with(ParsedFile::default);
+                if line.starts_with("+++ ") || file.title.is_empty() {
+                    file.title = path;
+                }
+            }
+            continue;
+        }
+
+        if line.starts_with("@@") {
+            let file = cur.get_or_insert_with(ParsedFile::default);
+            (old_ln, new_ln) = parse_hunk_header(line);
+            in_hunk = true;
+            file.rows.push(ParsedRow::Hunk(line.to_string()));
+            continue;
+        }
+
+        if !in_hunk {
+            // Stray content (e.g. non-diff input): show it verbatim.
+            let file = cur.get_or_insert_with(ParsedFile::default);
+            file.rows.push(ParsedRow::Verbatim(line.to_string()));
+            continue;
+        }
+
+        let file = cur.get_or_insert_with(ParsedFile::default);
+        match line.chars().next() {
+            Some('+') => {
+                file.rows.push(ParsedRow::Content {
+                    kind: SideKind::Added,
+                    old: None,
+                    new: Some(new_ln),
+                    text: line[1..].to_string(),
+                });
+                new_ln += 1;
+            }
+            Some('-') => {
+                file.rows.push(ParsedRow::Content {
+                    kind: SideKind::Removed,
+                    old: Some(old_ln),
+                    new: None,
+                    text: line[1..].to_string(),
+                });
+                old_ln += 1;
+            }
+            Some('\\') => {} // "\ No newline at end of file"
+            _ => {
+                // Context line (leading space, or an empty line).
+                file.rows.push(ParsedRow::Content {
+                    kind: SideKind::Context,
+                    old: Some(old_ln),
+                    new: Some(new_ln),
+                    text: line.strip_prefix(' ').unwrap_or(line).to_string(),
+                });
+                old_ln += 1;
+                new_ln += 1;
+            }
+        }
+    }
+
+    files.extend(cur);
+    files
+}
+
+/// Turn parsed files into renderable [`FileDiff`]s: apply syntax highlighting,
+/// pair removed/added lines side by side, and compute intra-line emphasis.
+fn build_files(parsed: Vec<ParsedFile>) -> Vec<FileDiff> {
     let syntaxes = SyntaxSet::load_defaults_newlines();
     let mut themes = ThemeSet::load_defaults();
     let theme = themes
@@ -230,16 +346,20 @@ fn parse(raw: &str) -> Vec<FileDiff> {
         .or_else(|| themes.themes.values().next().cloned())
         .expect("syntect ships at least one default theme");
 
-    let mut files: Vec<FileDiff> = Vec::new();
-    let mut cur: Option<FileDiff> = None;
+    parsed
+        .into_iter()
+        .map(|file| build_file(file, &syntaxes, &theme))
+        .collect()
+}
+
+/// Build one file's renderable rows from its parsed form.
+fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff {
+    let syntax = syntax_for_title(syntaxes, &file.title);
+    let mut rows: Vec<Row> = Vec::new();
     // Buffered runs of removed/added lines, paired when the run ends.
     let mut removed: Vec<SideLine> = Vec::new();
     let mut added: Vec<SideLine> = Vec::new();
-    let mut old_ln = 0usize;
-    let mut new_ln = 0usize;
-    let mut in_hunk = false;
-    // Syntax for the current file, and a per-hunk highlighter for each side.
-    let mut syntax: Option<&SyntaxReference> = None;
+    // A per-hunk highlighter for each side, reset at every hunk header.
     let mut old_hl: Option<HighlightLines> = None;
     let mut new_hl: Option<HighlightLines> = None;
 
@@ -257,119 +377,79 @@ fn parse(raw: &str) -> Vec<FileDiff> {
         }
     };
 
-    for line in raw.lines() {
-        if line.starts_with("diff --git") {
-            if let Some(f) = cur.as_mut() {
-                flush(&mut f.rows, &mut removed, &mut added);
+    for row in file.rows {
+        match row {
+            ParsedRow::Hunk(text) => {
+                flush(&mut rows, &mut removed, &mut added);
+                old_hl = syntax.map(|s| HighlightLines::new(s, theme));
+                new_hl = syntax.map(|s| HighlightLines::new(s, theme));
+                rows.push(Row::Full(text, hunk_style()));
             }
-            files.extend(cur.take());
-            cur = Some(FileDiff {
-                title: title_from_diff_git(line),
-                rows: Vec::new(),
-            });
-            syntax = None;
-            in_hunk = false;
-            old_hl = None;
-            new_hl = None;
-            continue;
-        }
-
-        if is_file_meta(line) {
-            if let Some(f) = cur.as_mut() {
-                flush(&mut f.rows, &mut removed, &mut added);
+            ParsedRow::Verbatim(text) => {
+                flush(&mut rows, &mut removed, &mut added);
+                rows.push(Row::Full(text, Style::default()));
             }
-            in_hunk = false;
-            // Use the +++/--- paths to pick a syntax and refine the title.
-            if let Some(rest) = line
-                .strip_prefix("+++ ")
-                .or_else(|| line.strip_prefix("--- "))
-            {
-                if let Some(s) = syntax_for_path(&syntaxes, rest) {
-                    syntax = Some(s);
-                }
-                if let Some(path) = clean_path(rest) {
-                    let file = cur.get_or_insert_with(FileDiff::default);
-                    if line.starts_with("+++ ") || file.title.is_empty() {
-                        file.title = path;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if line.starts_with("@@") {
-            let file = cur.get_or_insert_with(FileDiff::default);
-            flush(&mut file.rows, &mut removed, &mut added);
-            (old_ln, new_ln) = parse_hunk_header(line);
-            in_hunk = true;
-            old_hl = syntax.map(|s| HighlightLines::new(s, &theme));
-            new_hl = syntax.map(|s| HighlightLines::new(s, &theme));
-            file.rows.push(Row::Full(line.to_string(), hunk_style()));
-            continue;
-        }
-
-        if !in_hunk {
-            // Stray content (e.g. non-diff input): show it verbatim.
-            let file = cur.get_or_insert_with(FileDiff::default);
-            file.rows
-                .push(Row::Full(line.to_string(), Style::default()));
-            continue;
-        }
-
-        match line.chars().next() {
-            Some('+') => {
-                let segs = highlight(&mut new_hl, &syntaxes, &expand_tabs(&line[1..]));
+            ParsedRow::Content {
+                kind: SideKind::Added,
+                new,
+                text,
+                ..
+            } => {
+                let segs = highlight(&mut new_hl, syntaxes, &expand_tabs(&text));
                 added.push(SideLine {
-                    num: new_ln,
+                    num: new.unwrap_or(0),
                     segs,
                     kind: SideKind::Added,
                     emph: Vec::new(),
                 });
-                new_ln += 1;
             }
-            Some('-') => {
-                let segs = highlight(&mut old_hl, &syntaxes, &expand_tabs(&line[1..]));
+            ParsedRow::Content {
+                kind: SideKind::Removed,
+                old,
+                text,
+                ..
+            } => {
+                let segs = highlight(&mut old_hl, syntaxes, &expand_tabs(&text));
                 removed.push(SideLine {
-                    num: old_ln,
+                    num: old.unwrap_or(0),
                     segs,
                     kind: SideKind::Removed,
                     emph: Vec::new(),
                 });
-                old_ln += 1;
             }
-            Some('\\') => {} // "\ No newline at end of file"
-            _ => {
-                // Context line (leading space, or an empty line).
-                let file = cur.get_or_insert_with(FileDiff::default);
-                flush(&mut file.rows, &mut removed, &mut added);
-                let text = expand_tabs(line.strip_prefix(' ').unwrap_or(line));
-                let left = highlight(&mut old_hl, &syntaxes, &text);
-                let right = highlight(&mut new_hl, &syntaxes, &text);
-                file.rows.push(Row::Pair {
+            ParsedRow::Content {
+                kind: SideKind::Context,
+                old,
+                new,
+                text,
+            } => {
+                flush(&mut rows, &mut removed, &mut added);
+                let expanded = expand_tabs(&text);
+                let left = highlight(&mut old_hl, syntaxes, &expanded);
+                let right = highlight(&mut new_hl, syntaxes, &expanded);
+                rows.push(Row::Pair {
                     left: Some(SideLine {
-                        num: old_ln,
+                        num: old.unwrap_or(0),
                         segs: left,
                         kind: SideKind::Context,
                         emph: Vec::new(),
                     }),
                     right: Some(SideLine {
-                        num: new_ln,
+                        num: new.unwrap_or(0),
                         segs: right,
                         kind: SideKind::Context,
                         emph: Vec::new(),
                     }),
                 });
-                old_ln += 1;
-                new_ln += 1;
             }
         }
     }
 
-    if let Some(f) = cur.as_mut() {
-        flush(&mut f.rows, &mut removed, &mut added);
+    flush(&mut rows, &mut removed, &mut added);
+    FileDiff {
+        title: file.title,
+        rows,
     }
-    files.extend(cur);
-    files
 }
 
 /// Highlight one already-tab-expanded line into colored segments.
@@ -577,10 +657,9 @@ fn clean_path(raw: &str) -> Option<String> {
     (path != "/dev/null").then(|| path.to_string())
 }
 
-/// Look up a syntax for a diff path like `b/src/main.rs`.
-fn syntax_for_path<'a>(syntaxes: &'a SyntaxSet, raw_path: &str) -> Option<&'a SyntaxReference> {
-    let path = clean_path(raw_path)?;
-    let ext = Path::new(&path).extension()?.to_str()?;
+/// Look up a syntax from a cleaned file title like `src/main.rs`.
+fn syntax_for_title<'a>(syntaxes: &'a SyntaxSet, title: &str) -> Option<&'a SyntaxReference> {
+    let ext = Path::new(title).extension()?.to_str()?;
     syntaxes.find_syntax_by_extension(ext)
 }
 
@@ -632,4 +711,88 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
 
 fn hunk_style() -> Style {
     Style::default().fg(Color::Cyan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hunk_header_ignores_arrow_in_context() {
+        // Rust's `->` in the function-context suffix must not be mistaken for a
+        // line-number token. (Regression test.)
+        let (old, new) = parse_hunk_header("@@ -300,7 +300,8 @@ fn bar() -> Result<()>");
+        assert_eq!((old, new), (300, 300));
+    }
+
+    #[test]
+    fn hunk_header_without_counts() {
+        let (old, new) = parse_hunk_header("@@ -42 +57 @@");
+        assert_eq!((old, new), (42, 57));
+    }
+
+    /// Pull out only the `Content` rows for terser assertions.
+    fn content(file: &ParsedFile) -> Vec<(SideKind, Option<usize>, Option<usize>, &str)> {
+        file.rows
+            .iter()
+            .filter_map(|r| match r {
+                ParsedRow::Content {
+                    kind,
+                    old,
+                    new,
+                    text,
+                } => Some((*kind, *old, *new, text.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assigns_line_numbers_from_hunk_start() {
+        let raw = "\
+diff --git a/foo.rs b/foo.rs
+--- a/foo.rs
++++ b/foo.rs
+@@ -300,3 +300,3 @@ fn bar() -> Result<()>
+ ctx
+-old line
++new line
+";
+        let files = parse(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].title, "foo.rs");
+        assert_eq!(
+            content(&files[0]),
+            vec![
+                (SideKind::Context, Some(300), Some(300), "ctx"),
+                (SideKind::Removed, Some(301), None, "old line"),
+                (SideKind::Added, None, Some(301), "new line"),
+            ],
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_old_path_for_deletions() {
+        let raw = "\
+diff --git a/gone.rs b/gone.rs
+--- a/gone.rs
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let files = parse(raw);
+        assert_eq!(files[0].title, "gone.rs");
+    }
+
+    #[test]
+    fn non_diff_input_is_kept_verbatim() {
+        let files = parse("just some text\nnot a diff\n");
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0]
+                .rows
+                .iter()
+                .all(|r| matches!(r, ParsedRow::Verbatim(_)))
+        );
+    }
 }
