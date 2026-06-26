@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -31,6 +33,8 @@ const NUM_WIDTH: usize = 4;
 const TAB_WIDTH: usize = 4;
 /// Blank rows between adjacent file blocks.
 const FILE_GAP: u16 = 1;
+/// Rows scrolled per mouse-wheel notch.
+const MOUSE_SCROLL_LINES: i32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SideKind {
@@ -103,10 +107,12 @@ impl DiffViewer {
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
 
-            if let Some(Ok(Event::Key(key))) = reader.next().await
-                && key.kind == KeyEventKind::Press
-            {
-                self.handle_key(key);
+            match reader.next().await {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    self.handle_key(key)
+                }
+                Some(Ok(Event::Mouse(mouse))) => self.handle_mouse(mouse),
+                _ => {}
             }
         }
         Ok(())
@@ -191,6 +197,14 @@ impl DiffViewer {
             (_, KeyCode::Char('u') | KeyCode::PageUp) => self.scroll_by(-(page as i32)),
             (_, KeyCode::Char('g') | KeyCode::Home) => self.scroll = 0,
             (_, KeyCode::Char('G') | KeyCode::End) => self.scroll = self.max_scroll(),
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll_by(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollUp => self.scroll_by(-MOUSE_SCROLL_LINES),
             _ => {}
         }
     }
@@ -397,9 +411,12 @@ fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff
                 old_hl = syntax.map(|s| HighlightLines::new(s, theme));
                 new_hl = syntax.map(|s| HighlightLines::new(s, theme));
                 // Pad the hunk header with a blank row above and below, sharing
-                // the header's style so it reads as one band.
-                rows.push(blank_row(hunk_style()));
-                rows.push(Row::Full(text, hunk_style()));
+                // the header's style so it reads as one band. The first hunk
+                // gets no top pad — it already sits under the block's top border.
+                if !rows.is_empty() {
+                    rows.push(blank_row(hunk_style()));
+                }
+                rows.push(Row::Full(format!(" {text}"), hunk_style()));
                 rows.push(blank_row(hunk_style()));
             }
             ParsedRow::Verbatim(text) => {
@@ -727,7 +744,9 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
 
 fn hunk_style() -> Style {
     // #253143
-    Style::default().fg(Color::Gray).bg(Color::Rgb(40, 40, 60))
+    Style::default()
+        .fg(Color::Rgb(145, 152, 161))
+        .bg(Color::Rgb(37, 49, 67))
 }
 
 /// A blank full-width padding row in the given style.

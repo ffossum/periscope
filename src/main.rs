@@ -31,7 +31,9 @@ async fn run_diff(file: Option<std::path::PathBuf>) -> color_eyre::Result<()> {
     // stdin (`git diff | periscope diff`) doesn't interfere with the event loop.
     let mut viewer = DiffViewer::new(&raw);
     let mut terminal = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let result = viewer.run(&mut terminal).await;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 
     result
