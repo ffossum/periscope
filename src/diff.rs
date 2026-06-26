@@ -377,11 +377,13 @@ fn build_files(parsed: Vec<ParsedFile>) -> Vec<FileDiff> {
 /// Build one file's renderable rows from its parsed form.
 fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff {
     let syntax = syntax_for_title(syntaxes, &file.title);
-    // Show renames as `old → new`; otherwise just the path.
-    let title = match &file.rename_from {
+    // Show renames as `old → new`; otherwise just the path. A file-type glyph
+    // (chosen from the current path) is prepended either way.
+    let name = match &file.rename_from {
         Some(from) if *from != file.title => format!("{from} → {}", file.title),
         _ => file.title.clone(),
     };
+    let title = format!("{} {name}", file_icon(&file.title));
     let mut rows: Vec<Row> = Vec::new();
     // Buffered runs of removed/added lines, paired when the run ends.
     let mut removed: Vec<SideLine> = Vec::new();
@@ -696,6 +698,56 @@ fn syntax_for_title<'a>(syntaxes: &'a SyntaxSet, title: &str) -> Option<&'a Synt
     syntaxes.find_syntax_by_extension(ext)
 }
 
+/// A Nerd Font glyph for a file, chosen by filename then extension.
+///
+/// Codepoints are from the Nerd Fonts private-use range; the comments name the
+/// glyph class so they're easy to tweak. Falls back to a generic file glyph.
+fn file_icon(path: &str) -> char {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // A few well-known extensionless files matched by whole name.
+    match name.to_ascii_lowercase().as_str() {
+        "dockerfile" => return '\u{f308}',    // nf-linux-docker
+        "makefile" => return '\u{e673}',      // nf-seti-makefile
+        "license" => return '\u{f0fc7}',      // nf-md-certificate
+        ".gitignore" | ".gitattributes" => return '\u{e702}', // nf-dev-git
+        _ => {}
+    }
+
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "rs" => '\u{e7a8}',                          // nf-dev-rust
+        "py" => '\u{e606}',                          // nf-seti-python
+        "js" | "mjs" | "cjs" => '\u{e74e}',          // nf-dev-javascript
+        "ts" => '\u{e628}',                          // nf-seti-typescript
+        "jsx" | "tsx" => '\u{e7ba}',                 // nf-dev-react
+        "html" | "htm" => '\u{e736}',                // nf-dev-html5
+        "css" => '\u{e749}',                         // nf-dev-css3
+        "scss" | "sass" => '\u{e603}',               // nf-seti-sass
+        "json" => '\u{e60b}',                        // nf-seti-json
+        "md" | "markdown" => '\u{e73e}',             // nf-dev-markdown
+        "c" | "h" => '\u{e61e}',                     // nf-custom-c
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" => '\u{e61d}', // nf-custom-cpp
+        "go" => '\u{e627}',                          // nf-seti-go
+        "java" => '\u{e738}',                        // nf-dev-java
+        "scala" | "sc" => '\u{e737}',                // nf-dev-scala
+        "rb" => '\u{e739}',                          // nf-dev-ruby
+        "sh" | "bash" | "zsh" | "fish" => '\u{e795}', // nf-seti-shell
+        "toml" => '\u{e6b2}',                        // nf-seti-config-ish
+        "yaml" | "yml" => '\u{e615}',                // nf-seti-yml
+        "lock" => '\u{f023}',                        // nf-fa-lock
+        "txt" => '\u{f15c}',                         // nf-fa-file_text
+        _ => '\u{f15b}',                             // nf-fa-file (generic)
+    }
+}
+
 /// Pull the new-file path out of a `diff --git a/<path> b/<path>` line.
 fn title_from_diff_git(line: &str) -> String {
     line.split_whitespace()
@@ -841,7 +893,15 @@ rename to new/name.rs
         let parsed = parse(raw);
         assert_eq!(parsed[0].rename_from.as_deref(), Some("old/name.rs"));
         assert_eq!(parsed[0].title, "new/name.rs");
-        assert_eq!(build_files(parsed)[0].title, "old/name.rs → new/name.rs");
+        // Title carries a leading file-type glyph, then the rename arrow.
+        assert!(build_files(parsed)[0].title.ends_with("old/name.rs → new/name.rs"));
+    }
+
+    #[test]
+    fn file_icon_by_extension_and_name() {
+        assert_eq!(file_icon("src/main.rs"), '\u{e7a8}');
+        assert_eq!(file_icon("Dockerfile"), '\u{f308}');
+        assert_eq!(file_icon("weird.unknownext"), '\u{f15b}');
     }
 
     #[test]
