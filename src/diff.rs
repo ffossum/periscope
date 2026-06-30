@@ -135,7 +135,7 @@ impl Palette {
             removed_bg: mix(bg, RED, 0.14),
             removed_emph_bg: mix(bg, RED, 0.30),
             removed_gutter: rgb_color(RED),
-            added_bg: mix(bg, GREEN, 0.10),
+            added_bg: mix(bg, GREEN, 0.12),
             added_emph_bg: mix(bg, GREEN, 0.30),
             added_gutter: rgb_color(GREEN),
         }
