@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::{Color as SynColor, Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Read the diff from `file`, or from stdin when no file is given.
@@ -43,7 +43,6 @@ enum SideKind {
     Added,
 }
 
-/// A run of text sharing a single syntax-highlight foreground color.
 struct Seg {
     text: String,
     fg: Option<Color>,
@@ -84,18 +83,101 @@ impl FileDiff {
     }
 }
 
+/// UI colors derived from the active syntect theme's settings.
+#[derive(Clone, Copy)]
+struct Palette {
+    /// Default text foreground.
+    fg: Color,
+    /// Block borders.
+    border: Color,
+    /// The center separator between the two columns.
+    separator: Color,
+    /// Line-number gutter for context lines.
+    gutter: Color,
+    /// Hunk header foreground and background band.
+    hunk_fg: Color,
+    hunk_bg: Color,
+    /// Removed-side cell background, brighter intra-line emphasis, and gutter.
+    removed_bg: Color,
+    removed_emph_bg: Color,
+    removed_gutter: Color,
+    /// Added-side cell background, brighter intra-line emphasis, and gutter.
+    added_bg: Color,
+    added_emph_bg: Color,
+    added_gutter: Color,
+}
+
+impl Palette {
+    fn from_theme(theme: &Theme) -> Self {
+        let s = &theme.settings;
+        let bg = s.background.map(rgb).unwrap_or((0, 0, 0));
+        let fg = s.foreground.map(rgb).unwrap_or((220, 220, 220));
+        let gutter = s
+            .gutter_foreground
+            .map(conv)
+            .unwrap_or_else(|| mix(bg, fg, 0.5));
+
+        // Themes don't define diff add/remove colors, so tint the theme
+        // background toward red/green. Blending off the background keeps the
+        // tints in step with light vs dark themes.
+        const RED: (u8, u8, u8) = (220, 80, 80);
+        const GREEN: (u8, u8, u8) = (90, 190, 110);
+        const BLUE: (u8, u8, u8) = (100, 120, 220);
+
+        Self {
+            fg: rgb_color(fg),
+            border: gutter,
+            separator: gutter,
+            gutter,
+            hunk_fg: rgb_color(fg),
+            // A subtle band, lighter than the background and tinted blue.
+            hunk_bg: mix(bg, BLUE, 0.18),
+            removed_bg: mix(bg, RED, 0.14),
+            removed_emph_bg: mix(bg, RED, 0.30),
+            removed_gutter: rgb_color(RED),
+            added_bg: mix(bg, GREEN, 0.10),
+            added_emph_bg: mix(bg, GREEN, 0.30),
+            added_gutter: rgb_color(GREEN),
+        }
+    }
+}
+
+/// A syntect color as an `(r, g, b)` tuple.
+fn rgb(c: SynColor) -> (u8, u8, u8) {
+    (c.r, c.g, c.b)
+}
+
+/// A syntect color as a ratatui [`Color`].
+fn conv(c: SynColor) -> Color {
+    Color::Rgb(c.r, c.g, c.b)
+}
+
+/// An `(r, g, b)` tuple as a ratatui [`Color`].
+fn rgb_color((r, g, b): (u8, u8, u8)) -> Color {
+    Color::Rgb(r, g, b)
+}
+
+/// Linear blend of two colors; `t` is the weight given to `b`.
+fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
+    let lerp = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+}
+
 pub struct DiffViewer {
     running: bool,
     files: Vec<FileDiff>,
+    palette: Palette,
     scroll: u16,
     viewport_height: u16,
 }
 
 impl DiffViewer {
     pub fn new(raw: &str) -> Self {
+        let (files, palette) = build_files(parse(raw));
         Self {
             running: true,
-            files: build_files(parse(raw)),
+            files,
+            palette,
             scroll: 0,
             viewport_height: 0,
         }
@@ -129,7 +211,7 @@ impl DiffViewer {
 
         let scroll = self.scroll as i32;
         let viewport = area.height as i32;
-        let border_style = Style::default().fg(Color::Gray);
+        let border_style = Style::default().fg(self.palette.border);
 
         // Virtual top of the current file in the full stacked layout.
         let mut top = 0i32;
@@ -162,7 +244,10 @@ impl DiffViewer {
 
             let mut block = Block::default().borders(borders).border_style(border_style);
             if borders.contains(Borders::TOP) {
-                block = block.title(format!(" {} ", file.title));
+                block = block.title(Line::from(Span::styled(
+                    format!(" {} ", file.title),
+                    Style::default().fg(self.palette.fg),
+                )));
             }
 
             let rect = Rect::new(
@@ -180,7 +265,7 @@ impl DiffViewer {
             let inner_w = inner.width as usize;
             let lines: Vec<Line> = file.rows[first as usize..last as usize]
                 .iter()
-                .map(|row| render_row(row, inner_w))
+                .map(|row| render_row(row, inner_w, &self.palette))
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
         }
@@ -359,23 +444,35 @@ fn parse(raw: &str) -> Vec<ParsedFile> {
 
 /// Turn parsed files into renderable [`FileDiff`]s: apply syntax highlighting,
 /// pair removed/added lines side by side, and compute intra-line emphasis.
-fn build_files(parsed: Vec<ParsedFile>) -> Vec<FileDiff> {
+fn build_files(parsed: Vec<ParsedFile>) -> (Vec<FileDiff>, Palette) {
     let syntaxes = SyntaxSet::load_defaults_newlines();
-    let mut themes = ThemeSet::load_defaults();
-    let theme = themes
-        .themes
-        .remove("base16-ocean.dark")
-        .or_else(|| themes.themes.values().next().cloned())
-        .expect("syntect ships at least one default theme");
+    let theme = load_theme();
+    let palette = Palette::from_theme(&theme);
 
-    parsed
+    let files = parsed
         .into_iter()
-        .map(|file| build_file(file, &syntaxes, &theme))
-        .collect()
+        .map(|file| build_file(file, &syntaxes, &theme, &palette))
+        .collect();
+    (files, palette)
+}
+
+/// Load the syntax-highlighting theme.
+///
+/// The Enki-Tokyo-Night `.tmTheme` is embedded at compile time so it loads
+/// regardless of the working directory (periscope runs as git's `pager.diff`).
+fn load_theme() -> Theme {
+    const ENKI_TOKYO_NIGHT: &str = include_str!("../themes/Enki-Tokyo-Night.tmTheme");
+    let mut cursor = std::io::Cursor::new(ENKI_TOKYO_NIGHT.as_bytes());
+    ThemeSet::load_from_reader(&mut cursor).expect("bundled Enki-Tokyo-Night theme parses")
 }
 
 /// Build one file's renderable rows from its parsed form.
-fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff {
+fn build_file(
+    file: ParsedFile,
+    syntaxes: &SyntaxSet,
+    theme: &Theme,
+    palette: &Palette,
+) -> FileDiff {
     let syntax = syntax_for_title(syntaxes, &file.title);
     // Show renames as `old → new`; otherwise just the path. A file-type glyph
     // (chosen from the current path) is prepended either way.
@@ -416,10 +513,10 @@ fn build_file(file: ParsedFile, syntaxes: &SyntaxSet, theme: &Theme) -> FileDiff
                 // the header's style so it reads as one band. The first hunk
                 // gets no top pad — it already sits under the block's top border.
                 if !rows.is_empty() {
-                    rows.push(blank_row(hunk_style()));
+                    rows.push(blank_row(hunk_style(palette)));
                 }
-                rows.push(Row::Full(format!(" {text}"), hunk_style()));
-                rows.push(blank_row(hunk_style()));
+                rows.push(Row::Full(format!(" {text}"), hunk_style(palette)));
+                rows.push(blank_row(hunk_style(palette)));
             }
             ParsedRow::Verbatim(text) => {
                 flush(&mut rows, &mut removed, &mut added);
@@ -504,11 +601,7 @@ fn highlight(hl: &mut Option<HighlightLines>, syntaxes: &SyntaxSet, text: &str) 
             .into_iter()
             .map(|(style, s)| Seg {
                 text: s.trim_end_matches('\n').to_string(),
-                fg: Some(Color::Rgb(
-                    style.foreground.r,
-                    style.foreground.g,
-                    style.foreground.b,
-                )),
+                fg: Some(conv(style.foreground)),
             })
             .filter(|seg| !seg.text.is_empty())
             .collect(),
@@ -561,7 +654,7 @@ fn mark_intra_line(left: &mut SideLine, right: &mut SideLine) {
 }
 
 /// Render a row to a single full-width `Line`, split into two columns.
-fn render_row(row: &Row, width: usize) -> Line<'static> {
+fn render_row(row: &Row, width: usize, p: &Palette) -> Line<'static> {
     match row {
         Row::Full(text, style) => Line::from(Span::styled(fit(text, width), *style)),
         Row::Pair { left, right } => {
@@ -570,19 +663,19 @@ fn render_row(row: &Row, width: usize) -> Line<'static> {
             let left_w = avail / 2;
             let right_w = avail - left_w;
 
-            let mut spans = cell_spans(left.as_ref(), left_w);
+            let mut spans = cell_spans(left.as_ref(), left_w, p);
             spans.push(Span::styled(
                 "│".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.separator),
             ));
-            spans.extend(cell_spans(right.as_ref(), right_w));
+            spans.extend(cell_spans(right.as_ref(), right_w, p));
             Line::from(spans)
         }
     }
 }
 
 /// Build the spans for one side of a pair, fitted to `width`.
-fn cell_spans(side: Option<&SideLine>, width: usize) -> Vec<Span<'static>> {
+fn cell_spans(side: Option<&SideLine>, width: usize, p: &Palette) -> Vec<Span<'static>> {
     let Some(s) = side else {
         return vec![Span::raw(" ".repeat(width))];
     };
@@ -590,8 +683,8 @@ fn cell_spans(side: Option<&SideLine>, width: usize) -> Vec<Span<'static>> {
     // `bg` paints the whole cell; `emph_bg` highlights chars that changed
     // relative to the paired line on the other side.
     let (bg, emph_bg) = match s.kind {
-        SideKind::Removed => (Some(Color::Rgb(60, 30, 30)), Some(Color::Rgb(110, 45, 45))),
-        SideKind::Added => (Some(Color::Rgb(25, 50, 30)), Some(Color::Rgb(35, 95, 50))),
+        SideKind::Removed => (Some(p.removed_bg), Some(p.removed_emph_bg)),
+        SideKind::Added => (Some(p.added_bg), Some(p.added_emph_bg)),
         SideKind::Context => (None, None),
     };
     let marker = match s.kind {
@@ -600,12 +693,16 @@ fn cell_spans(side: Option<&SideLine>, width: usize) -> Vec<Span<'static>> {
         SideKind::Context => ' ',
     };
     let gutter_fg = match s.kind {
-        SideKind::Removed => Color::Red,
-        SideKind::Added => Color::Green,
-        SideKind::Context => Color::DarkGray,
+        SideKind::Removed => p.removed_gutter,
+        SideKind::Added => p.added_gutter,
+        SideKind::Context => p.gutter,
     };
 
-    let base = bg.map_or_else(Style::default, |b| Style::default().bg(b));
+    // Theme foreground is the default; syntax-colored segs override it below.
+    let base = match bg {
+        Some(b) => Style::default().fg(p.fg).bg(b),
+        None => Style::default().fg(p.fg),
+    };
     let emph = emph_bg.map_or(base, |b| base.bg(b));
 
     let gutter = format!("{:>NUM_WIDTH$} {marker}", s.num);
@@ -710,9 +807,9 @@ fn file_icon(path: &str) -> char {
 
     // A few well-known extensionless files matched by whole name.
     match name.to_ascii_lowercase().as_str() {
-        "dockerfile" => return '\u{f308}',    // nf-linux-docker
-        "makefile" => return '\u{e673}',      // nf-seti-makefile
-        "license" => return '\u{f0fc7}',      // nf-md-certificate
+        "dockerfile" => return '\u{f308}', // nf-linux-docker
+        "makefile" => return '\u{e673}',   // nf-seti-makefile
+        "license" => return '\u{f0fc7}',   // nf-md-certificate
         ".gitignore" | ".gitattributes" => return '\u{e702}', // nf-dev-git
         _ => {}
     }
@@ -723,28 +820,28 @@ fn file_icon(path: &str) -> char {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "rs" => '\u{e7a8}',                          // nf-dev-rust
-        "py" => '\u{e606}',                          // nf-seti-python
-        "js" | "mjs" | "cjs" => '\u{e74e}',          // nf-dev-javascript
-        "ts" => '\u{e628}',                          // nf-seti-typescript
-        "jsx" | "tsx" => '\u{e7ba}',                 // nf-dev-react
-        "html" | "htm" => '\u{e736}',                // nf-dev-html5
-        "css" => '\u{e749}',                         // nf-dev-css3
-        "scss" | "sass" => '\u{e603}',               // nf-seti-sass
-        "json" => '\u{e60b}',                        // nf-seti-json
-        "md" | "markdown" => '\u{e73e}',             // nf-dev-markdown
-        "c" | "h" => '\u{e61e}',                     // nf-custom-c
+        "rs" => '\u{e7a8}',                                // nf-dev-rust
+        "py" => '\u{e606}',                                // nf-seti-python
+        "js" | "mjs" | "cjs" => '\u{e74e}',                // nf-dev-javascript
+        "ts" => '\u{e628}',                                // nf-seti-typescript
+        "jsx" | "tsx" => '\u{e7ba}',                       // nf-dev-react
+        "html" | "htm" => '\u{e736}',                      // nf-dev-html5
+        "css" => '\u{e749}',                               // nf-dev-css3
+        "scss" | "sass" => '\u{e603}',                     // nf-seti-sass
+        "json" => '\u{e60b}',                              // nf-seti-json
+        "md" | "markdown" => '\u{e73e}',                   // nf-dev-markdown
+        "c" | "h" => '\u{e61e}',                           // nf-custom-c
         "cpp" | "cc" | "cxx" | "hpp" | "hh" => '\u{e61d}', // nf-custom-cpp
-        "go" => '\u{e627}',                          // nf-seti-go
-        "java" => '\u{e738}',                        // nf-dev-java
-        "scala" | "sc" => '\u{e737}',                // nf-dev-scala
-        "rb" => '\u{e739}',                          // nf-dev-ruby
-        "sh" | "bash" | "zsh" | "fish" => '\u{e795}', // nf-seti-shell
-        "toml" => '\u{e6b2}',                        // nf-seti-config-ish
-        "yaml" | "yml" => '\u{e615}',                // nf-seti-yml
-        "lock" => '\u{f023}',                        // nf-fa-lock
-        "txt" => '\u{f15c}',                         // nf-fa-file_text
-        _ => '\u{f15b}',                             // nf-fa-file (generic)
+        "go" => '\u{e627}',                                // nf-seti-go
+        "java" => '\u{e738}',                              // nf-dev-java
+        "scala" | "sc" => '\u{e737}',                      // nf-dev-scala
+        "rb" => '\u{e739}',                                // nf-dev-ruby
+        "sh" | "bash" | "zsh" | "fish" => '\u{e795}',      // nf-seti-shell
+        "toml" => '\u{e6b2}',                              // nf-seti-config-ish
+        "yaml" | "yml" => '\u{e615}',                      // nf-seti-yml
+        "lock" => '\u{f023}',                              // nf-fa-lock
+        "txt" => '\u{f15c}',                               // nf-fa-file_text
+        _ => '\u{f15b}',                                   // nf-fa-file (generic)
     }
 }
 
@@ -794,11 +891,8 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
     (old, new)
 }
 
-fn hunk_style() -> Style {
-    // #253143
-    Style::default()
-        .fg(Color::Rgb(145, 152, 161))
-        .bg(Color::Rgb(37, 49, 67))
+fn hunk_style(p: &Palette) -> Style {
+    Style::default().fg(p.hunk_fg).bg(p.hunk_bg)
 }
 
 /// A blank full-width padding row in the given style.
@@ -894,7 +988,11 @@ rename to new/name.rs
         assert_eq!(parsed[0].rename_from.as_deref(), Some("old/name.rs"));
         assert_eq!(parsed[0].title, "new/name.rs");
         // Title carries a leading file-type glyph, then the rename arrow.
-        assert!(build_files(parsed)[0].title.ends_with("old/name.rs → new/name.rs"));
+        assert!(
+            build_files(parsed).0[0]
+                .title
+                .ends_with("old/name.rs → new/name.rs")
+        );
     }
 
     #[test]
