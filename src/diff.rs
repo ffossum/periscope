@@ -304,9 +304,18 @@ impl DiffViewer {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Holding Shift turns the vertical wheel into horizontal scroll, the
+        // usual convention for panning content wider than the viewport.
+        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
         match mouse.kind {
+            MouseEventKind::ScrollDown if shift => self.hscroll_by(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollUp if shift => self.hscroll_by(-MOUSE_SCROLL_LINES),
             MouseEventKind::ScrollDown => self.scroll_by(MOUSE_SCROLL_LINES),
             MouseEventKind::ScrollUp => self.scroll_by(-MOUSE_SCROLL_LINES),
+            // Mice with a horizontal wheel (or terminals that map Shift+wheel
+            // to these) scroll the columns directly.
+            MouseEventKind::ScrollRight => self.hscroll_by(MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollLeft => self.hscroll_by(-MOUSE_SCROLL_LINES),
             _ => {}
         }
     }
