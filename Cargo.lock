@@ -1139,6 +1139,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "similar",

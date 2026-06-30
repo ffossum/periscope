@@ -9,6 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use regex::{Regex, RegexBuilder};
 use similar::{ChangeTag, TextDiff};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SynColor, Theme, ThemeSet};
@@ -109,6 +110,11 @@ struct Palette {
     added_bg: Color,
     added_emph_bg: Color,
     added_gutter: Color,
+    /// Search-match foreground (high contrast), plus the background for other
+    /// matches and the currently-selected one.
+    search_fg: Color,
+    search_bg: Color,
+    search_current_bg: Color,
 }
 
 impl Palette {
@@ -127,6 +133,9 @@ impl Palette {
         const RED: (u8, u8, u8) = (220, 80, 80);
         const GREEN: (u8, u8, u8) = (90, 190, 110);
         const BLUE: (u8, u8, u8) = (100, 120, 220);
+        // Search hits use a fixed yellow/orange standout, dark text on top.
+        const YELLOW: (u8, u8, u8) = (224, 198, 92);
+        const ORANGE: (u8, u8, u8) = (240, 150, 70);
 
         Self {
             fg: rgb_color(fg),
@@ -142,6 +151,9 @@ impl Palette {
             added_bg: mix(bg, GREEN, 0.12),
             added_emph_bg: mix(bg, GREEN, 0.30),
             added_gutter: rgb_color(GREEN),
+            search_fg: rgb_color(bg),
+            search_bg: rgb_color(YELLOW),
+            search_current_bg: rgb_color(ORANGE),
         }
     }
 }
@@ -167,6 +179,42 @@ fn mix(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> Color {
     Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
 }
 
+/// Which part of a row a search hit lives in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MatchSide {
+    Left,
+    Right,
+    Full,
+}
+
+/// A single regex hit, located precisely enough to scroll to and highlight.
+#[derive(Clone, Copy)]
+struct SearchMatch {
+    file: usize,
+    row: usize,
+    side: MatchSide,
+    /// Char range within the cell/row content (gutter excluded).
+    start: usize,
+    end: usize,
+    /// Absolute row in the stacked layout, for vertical scrolling.
+    vrow: u16,
+}
+
+/// An executed search: the pattern, all its hits, and the focused one.
+struct Search {
+    pattern: String,
+    matches: Vec<SearchMatch>,
+    current: usize,
+}
+
+/// Char ranges to highlight within one row, split by where they fall.
+#[derive(Default)]
+struct RowHls {
+    left: Vec<(usize, usize)>,
+    right: Vec<(usize, usize)>,
+    full: Vec<(usize, usize)>,
+}
+
 pub struct DiffViewer {
     running: bool,
     files: Vec<FileDiff>,
@@ -178,6 +226,12 @@ pub struct DiffViewer {
     max_line_width: u16,
     viewport_height: u16,
     viewport_width: u16,
+    /// Some while typing a search pattern at the bottom prompt (`/`).
+    input: Option<String>,
+    /// The most recent executed search, kept for `n`/`N` and highlighting.
+    search: Option<Search>,
+    /// A transient one-line message (errors, "not found") shown at the bottom.
+    status: Option<String>,
 }
 
 impl DiffViewer {
@@ -193,6 +247,9 @@ impl DiffViewer {
             max_line_width,
             viewport_height: 0,
             viewport_width: 0,
+            input: None,
+            search: None,
+            status: None,
         }
     }
 
@@ -214,14 +271,31 @@ impl DiffViewer {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
+        let full = frame.area();
+
+        // Reserve the bottom row for the search prompt or a status message.
+        let show_status = self.input.is_some() || self.status.is_some();
+        let area = if show_status && full.height > 0 {
+            Rect::new(full.x, full.y, full.width, full.height - 1)
+        } else {
+            full
+        };
+
         self.viewport_height = area.height;
         self.viewport_width = area.width;
         self.clamp_scroll();
 
+        if show_status {
+            self.draw_status(frame, full);
+        }
+
         if area.width < 3 || area.height == 0 {
             return;
         }
+
+        // The focused match, and a per-row lookup of all hits to highlight.
+        let current = self.search.as_ref().and_then(|s| s.matches.get(s.current));
+        let row_hls = self.row_highlights();
 
         let scroll = self.scroll as i32;
         let viewport = area.height as i32;
@@ -229,7 +303,7 @@ impl DiffViewer {
 
         // Virtual top of the current file in the full stacked layout.
         let mut top = 0i32;
-        for file in &self.files {
+        for (fi, file) in self.files.iter().enumerate() {
             let block_h = file.height() as i32;
             let screen_top = top - scroll;
             top += block_h + FILE_GAP as i32;
@@ -279,17 +353,75 @@ impl DiffViewer {
             let inner_w = inner.width as usize;
             let lines: Vec<Line> = file.rows[first as usize..last as usize]
                 .iter()
-                .map(|row| render_row(row, inner_w, self.hscroll as usize, &self.palette))
+                .enumerate()
+                .map(|(off, row)| {
+                    let ri = first as usize + off;
+                    let hl = row_hls.get(&(fi, ri));
+                    // The focused match's range, if it falls on this row.
+                    let cur = current
+                        .filter(|m| m.file == fi && m.row == ri)
+                        .map(|m| (m.side, m.start, m.end));
+                    render_row(row, inner_w, self.hscroll as usize, hl, cur, &self.palette)
+                })
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
         }
     }
 
+    /// Render the bottom prompt: `/pattern` while typing, else the status text.
+    fn draw_status(&self, frame: &mut Frame, full: Rect) {
+        if full.height == 0 || full.width == 0 {
+            return;
+        }
+        let row = Rect::new(full.x, full.y + full.height - 1, full.width, 1);
+        let style = Style::default().fg(self.palette.fg);
+        if let Some(buf) = &self.input {
+            let text = format!("/{buf}");
+            let cursor_x = full.x + 1 + buf.chars().count() as u16;
+            frame.render_widget(Paragraph::new(Line::styled(text, style)), row);
+            frame.set_cursor_position((cursor_x.min(full.x + full.width - 1), row.y));
+        } else if let Some(msg) = &self.status {
+            frame.render_widget(Paragraph::new(Line::styled(msg.clone(), style)), row);
+        }
+    }
+
+    /// Group every current-search hit by `(file, row)` for fast lookup while
+    /// rendering. Returns an empty map when no search is active.
+    fn row_highlights(&self) -> std::collections::HashMap<(usize, usize), RowHls> {
+        let mut map: std::collections::HashMap<(usize, usize), RowHls> =
+            std::collections::HashMap::new();
+        let Some(search) = &self.search else {
+            return map;
+        };
+        for m in &search.matches {
+            let e = map.entry((m.file, m.row)).or_default();
+            let dst = match m.side {
+                MatchSide::Left => &mut e.left,
+                MatchSide::Right => &mut e.right,
+                MatchSide::Full => &mut e.full,
+            };
+            dst.push((m.start, m.end));
+        }
+        map
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
+        // While typing a pattern, all keys belong to the prompt.
+        if self.input.is_some() {
+            self.handle_search_input(key);
+            return;
+        }
+
+        // Any normal-mode key clears a lingering status message.
+        self.status = None;
+
         let page = self.viewport_height.max(1);
         match (key.modifiers, key.code) {
-            (_, KeyCode::Char('q') | KeyCode::Esc)
-            | (KeyModifiers::CONTROL, KeyCode::Char('c')) => self.running = false,
+            (_, KeyCode::Char('q')) | (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                self.running = false
+            }
+            // Esc clears the active search and its highlights, but never quits.
+            (_, KeyCode::Esc) => self.search = None,
             (_, KeyCode::Char('j') | KeyCode::Down) => self.scroll_by(1),
             (_, KeyCode::Char('k') | KeyCode::Up) => self.scroll_by(-1),
             (_, KeyCode::Char('d') | KeyCode::PageDown) => self.scroll_by(page as i32),
@@ -299,7 +431,149 @@ impl DiffViewer {
             (_, KeyCode::Char('g') | KeyCode::Home) => self.scroll = 0,
             (_, KeyCode::Char('G') | KeyCode::End) => self.scroll = self.max_scroll(),
             (_, KeyCode::Char('0')) => self.hscroll = 0,
+            (_, KeyCode::Char('/')) => self.input = Some(String::new()),
+            (_, KeyCode::Char('n')) => self.step_match(1),
+            (_, KeyCode::Char('N')) => self.step_match(-1),
             _ => {}
+        }
+    }
+
+    /// Edit the bottom search prompt: Enter runs it, Esc cancels, Backspace
+    /// deletes, printable keys append.
+    fn handle_search_input(&mut self, key: KeyEvent) {
+        match (key.modifiers, key.code) {
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => self.running = false,
+            (_, KeyCode::Esc) => self.input = None,
+            (_, KeyCode::Enter) => {
+                if let Some(pattern) = self.input.take() {
+                    self.execute_search(pattern);
+                }
+            }
+            (_, KeyCode::Backspace) => {
+                if let Some(buf) = self.input.as_mut() {
+                    buf.pop();
+                }
+            }
+            (_, KeyCode::Char(c)) => {
+                if let Some(buf) = self.input.as_mut() {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Compile and run `pattern`, focusing the first hit at or after the current
+    /// scroll position. Records errors / no-match to the status line.
+    fn execute_search(&mut self, pattern: String) {
+        if pattern.is_empty() {
+            self.search = None;
+            return;
+        }
+        let re = match build_regex(&pattern) {
+            Ok(re) => re,
+            Err(_) => {
+                self.status = Some(format!("Invalid regex: {pattern}"));
+                return;
+            }
+        };
+        let matches = self.find_matches(&re);
+        if matches.is_empty() {
+            self.status = Some(format!("Pattern not found: {pattern}"));
+            self.search = Some(Search {
+                pattern,
+                matches,
+                current: 0,
+            });
+            return;
+        }
+        let current = matches
+            .iter()
+            .position(|m| m.vrow >= self.scroll)
+            .unwrap_or(0);
+        self.search = Some(Search {
+            pattern,
+            matches,
+            current,
+        });
+        self.reveal_current();
+    }
+
+    /// Find every regex hit across all rows, in reading order (top to bottom,
+    /// left cell before right).
+    fn find_matches(&self, re: &Regex) -> Vec<SearchMatch> {
+        let mut out = Vec::new();
+        let mut top: u16 = 0;
+        for (fi, file) in self.files.iter().enumerate() {
+            for (ri, row) in file.rows.iter().enumerate() {
+                let vrow = top + 1 + ri as u16; // +1 skips the block's top border
+                let mut push = |side, ranges: Vec<(usize, usize)>| {
+                    for (start, end) in ranges {
+                        out.push(SearchMatch {
+                            file: fi,
+                            row: ri,
+                            side,
+                            start,
+                            end,
+                            vrow,
+                        });
+                    }
+                };
+                match row {
+                    Row::Full(text, _) => push(MatchSide::Full, find_ranges(re, text)),
+                    Row::Pair { left, right } => {
+                        if let Some(l) = left {
+                            push(MatchSide::Left, find_ranges(re, &side_text(l)));
+                        }
+                        if let Some(r) = right {
+                            push(MatchSide::Right, find_ranges(re, &side_text(r)));
+                        }
+                    }
+                }
+            }
+            top = top
+                .saturating_add(file.height())
+                .saturating_add(FILE_GAP);
+        }
+        out
+    }
+
+    /// Move to the next (`dir == 1`) or previous (`dir == -1`) match, wrapping.
+    fn step_match(&mut self, dir: i32) {
+        let Some(search) = self.search.as_mut() else {
+            self.status = Some("No previous search".to_string());
+            return;
+        };
+        let n = search.matches.len();
+        if n == 0 {
+            self.status = Some(format!("Pattern not found: {}", search.pattern));
+            return;
+        }
+        let cur = search.current as i32;
+        search.current = (cur + dir).rem_euclid(n as i32) as usize;
+        self.reveal_current();
+    }
+
+    /// Scroll so the focused match is on screen, vertically and horizontally.
+    fn reveal_current(&mut self) {
+        let Some(search) = self.search.as_ref() else {
+            return;
+        };
+        let Some(m) = search.matches.get(search.current).copied() else {
+            return;
+        };
+
+        // Vertical: a few rows of context above the hit.
+        const MARGIN: u16 = 3;
+        self.scroll = m.vrow.saturating_sub(MARGIN).min(self.max_scroll());
+
+        // Horizontal: only paired cells scroll; reveal the hit if it's off-screen.
+        if m.side != MatchSide::Full {
+            let cols = self.content_cols();
+            let h = self.hscroll as usize;
+            if cols > 0 && (m.start < h || m.end > h + cols) {
+                self.hscroll = (m.start.saturating_sub(2) as u16).min(self.max_hscroll());
+            }
         }
     }
 
@@ -720,34 +994,134 @@ fn mark_intra_line(left: &mut SideLine, right: &mut SideLine) {
     right.emph = rmask;
 }
 
+/// The background category of a content char, in increasing priority.
+#[derive(Clone, Copy, PartialEq)]
+enum Class {
+    Plain,
+    Emph,
+    Match,
+    Current,
+}
+
+/// A boolean mask of length `n` with the given char ranges set true.
+fn ranges_mask(n: usize, ranges: &[(usize, usize)]) -> Vec<bool> {
+    let mut mask = vec![false; n];
+    for &(start, end) in ranges {
+        for slot in mask.iter_mut().take(end.min(n)).skip(start) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
 /// Render a row to a single full-width `Line`, split into two columns.
 ///
 /// `hscroll` slides the content of both halves left by that many columns; the
 /// line-number gutters stay fixed. Full-width rows (hunk bands, verbatim text)
-/// are not horizontally scrolled.
-fn render_row(row: &Row, width: usize, hscroll: usize, p: &Palette) -> Line<'static> {
+/// are not horizontally scrolled. `hl` carries this row's search-hit ranges and
+/// `current` the focused hit (side + range) when it lands on this row.
+fn render_row(
+    row: &Row,
+    width: usize,
+    hscroll: usize,
+    hl: Option<&RowHls>,
+    current: Option<(MatchSide, usize, usize)>,
+    p: &Palette,
+) -> Line<'static> {
     match row {
-        Row::Full(text, style) => Line::from(Span::styled(fit(text, width), *style)),
+        Row::Full(text, style) => {
+            let hls = hl.map_or(&[][..], |h| h.full.as_slice());
+            let cur =
+                current.and_then(|(side, s, e)| (side == MatchSide::Full).then_some((s, e)));
+            if hls.is_empty() && cur.is_none() {
+                Line::from(Span::styled(fit(text, width), *style))
+            } else {
+                full_spans(text, width, *style, hls, cur, p)
+            }
+        }
         Row::Pair { left, right } => {
             // One column for the center separator, the rest split evenly.
             let avail = width.saturating_sub(1);
             let left_w = avail / 2;
             let right_w = avail - left_w;
 
-            let mut spans = cell_spans(left.as_ref(), left_w, hscroll, p);
+            let (lh, rh) = match hl {
+                Some(h) => (h.left.as_slice(), h.right.as_slice()),
+                None => (&[][..], &[][..]),
+            };
+            let lc = current.and_then(|(side, s, e)| (side == MatchSide::Left).then_some((s, e)));
+            let rc = current.and_then(|(side, s, e)| (side == MatchSide::Right).then_some((s, e)));
+
+            let mut spans = cell_spans(left.as_ref(), left_w, hscroll, lh, lc, p);
             spans.push(Span::styled(
                 "│".to_string(),
                 Style::default().fg(p.separator),
             ));
-            spans.extend(cell_spans(right.as_ref(), right_w, hscroll, p));
+            spans.extend(cell_spans(right.as_ref(), right_w, hscroll, rh, rc, p));
             Line::from(spans)
         }
     }
 }
 
+/// Render a full-width row with search hits highlighted.
+fn full_spans(
+    text: &str,
+    width: usize,
+    base: Style,
+    hls: &[(usize, usize)],
+    current: Option<(usize, usize)>,
+    p: &Palette,
+) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let hl_mask = ranges_mask(n, hls);
+    let cur_mask = ranges_mask(n, current.as_slice());
+    let search = Style::default().fg(p.search_fg).bg(p.search_bg);
+    let search_cur = Style::default().fg(p.search_fg).bg(p.search_current_bg);
+    let style_for = |class| match class {
+        Class::Current => search_cur,
+        Class::Match => search,
+        _ => base,
+    };
+
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_class = Class::Plain;
+    for (i, ch) in chars.into_iter().enumerate().take(width) {
+        let class = if cur_mask[i] {
+            Class::Current
+        } else if hl_mask[i] {
+            Class::Match
+        } else {
+            Class::Plain
+        };
+        if !run.is_empty() && class != run_class {
+            spans.push(Span::styled(std::mem::take(&mut run), style_for(run_class)));
+        }
+        run.push(ch);
+        run_class = class;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style_for(run_class)));
+    }
+    let used = n.min(width);
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), base));
+    }
+    Line::from(spans)
+}
+
 /// Build the spans for one side of a pair, fitted to `width`, with the content
-/// (but not the gutter) scrolled left by `hscroll` columns.
-fn cell_spans(side: Option<&SideLine>, width: usize, hscroll: usize, p: &Palette) -> Vec<Span<'static>> {
+/// (but not the gutter) scrolled left by `hscroll` columns. `hls`/`current`
+/// carry the search hits to highlight within this cell.
+fn cell_spans(
+    side: Option<&SideLine>,
+    width: usize,
+    hscroll: usize,
+    hls: &[(usize, usize)],
+    current: Option<(usize, usize)>,
+    p: &Palette,
+) -> Vec<Span<'static>> {
     let Some(s) = side else {
         return vec![Span::raw(" ".repeat(width))];
     };
@@ -780,8 +1154,15 @@ fn cell_spans(side: Option<&SideLine>, width: usize, hscroll: usize, p: &Palette
     let gutter = format!("{:>NUM_WIDTH$} {marker}", s.num);
     let mut spans = vec![Span::styled(gutter, base.fg(gutter_fg))];
 
-    // Walk segs and the change mask together, breaking each syntax run wherever
-    // emphasis toggles so changed character spans get the brighter background.
+    // Per-char masks for search hits, sized to the cell's content length.
+    let content_len: usize = s.segs.iter().map(|seg| seg.text.chars().count()).sum();
+    let hl_mask = ranges_mask(content_len, hls);
+    let cur_mask = ranges_mask(content_len, current.as_slice());
+    let search = Style::default().fg(p.search_fg).bg(p.search_bg);
+    let search_cur = Style::default().fg(p.search_fg).bg(p.search_current_bg);
+
+    // Walk segs and the masks together, breaking each syntax run wherever the
+    // background category changes (intra-line emphasis or a search hit).
     let mut ci = 0usize;
     for seg in &s.segs {
         let plain = match seg.fg {
@@ -792,24 +1173,37 @@ fn cell_spans(side: Option<&SideLine>, width: usize, hscroll: usize, p: &Palette
             Some(fg) => emph.fg(fg),
             None => emph,
         };
+        let style_for = |class| match class {
+            Class::Plain => plain,
+            Class::Emph => lit,
+            Class::Match => search,
+            Class::Current => search_cur,
+        };
         let mut run = String::new();
-        let mut run_emph = false;
+        let mut run_class = Class::Plain;
         for ch in seg.text.chars() {
-            let e = s.emph.get(ci).copied().unwrap_or(false);
+            let idx = ci;
             ci += 1;
             if ci <= hscroll {
                 continue; // scrolled off to the left
             }
-            if !run.is_empty() && e != run_emph {
-                let style = if run_emph { lit } else { plain };
-                spans.push(Span::styled(std::mem::take(&mut run), style));
+            let class = if cur_mask[idx] {
+                Class::Current
+            } else if hl_mask[idx] {
+                Class::Match
+            } else if s.emph.get(idx).copied().unwrap_or(false) {
+                Class::Emph
+            } else {
+                Class::Plain
+            };
+            if !run.is_empty() && class != run_class {
+                spans.push(Span::styled(std::mem::take(&mut run), style_for(run_class)));
             }
             run.push(ch);
-            run_emph = e;
+            run_class = class;
         }
         if !run.is_empty() {
-            let style = if run_emph { lit } else { plain };
-            spans.push(Span::styled(run, style));
+            spans.push(Span::styled(run, style_for(run_class)));
         }
     }
     fit_spans(spans, width, base)
@@ -852,6 +1246,33 @@ fn fit(s: &str, width: usize) -> String {
 
 fn expand_tabs(s: &str) -> String {
     s.replace('\t', &" ".repeat(TAB_WIDTH))
+}
+
+/// The full content text of one side of a pair, used as the search haystack.
+fn side_text(s: &SideLine) -> String {
+    s.segs.iter().map(|seg| seg.text.as_str()).collect()
+}
+
+/// Every non-empty match of `re` in `text`, as char (not byte) ranges so they
+/// line up with the char-indexed render masks.
+fn find_ranges(re: &Regex, text: &str) -> Vec<(usize, usize)> {
+    re.find_iter(text)
+        .filter(|m| m.start() < m.end())
+        .map(|m| {
+            let start = text[..m.start()].chars().count();
+            let end = text[..m.end()].chars().count();
+            (start, end)
+        })
+        .collect()
+}
+
+/// Compile a user pattern with smartcase: case-insensitive unless the pattern
+/// itself contains an uppercase letter.
+fn build_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    let case_insensitive = !pattern.chars().any(|c| c.is_uppercase());
+    RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()
 }
 
 /// Strip the leading `a/` or `b/` from a diff path, or `None` for `/dev/null`.
@@ -1087,5 +1508,37 @@ rename to new/name.rs
                 .iter()
                 .all(|r| matches!(r, ParsedRow::Verbatim(_)))
         );
+    }
+
+    #[test]
+    fn find_ranges_uses_char_offsets() {
+        // The é is two bytes but one char; ranges must be char-based so they
+        // line up with the char-indexed render masks.
+        let re = build_regex("bar").unwrap();
+        assert_eq!(find_ranges(&re, "éfoo barbar"), vec![(5, 8), (8, 11)]);
+    }
+
+    #[test]
+    fn find_ranges_skips_empty_matches() {
+        let re = build_regex("x*").unwrap();
+        assert!(find_ranges(&re, "abc").is_empty());
+    }
+
+    #[test]
+    fn build_regex_smartcase() {
+        // All-lowercase patterns match case-insensitively...
+        assert!(build_regex("todo").unwrap().is_match("TODO"));
+        // ...but an uppercase letter makes the search case-sensitive.
+        assert!(!build_regex("Todo").unwrap().is_match("todo"));
+    }
+
+    #[test]
+    fn ranges_mask_sets_only_covered_chars() {
+        assert_eq!(
+            ranges_mask(5, &[(1, 3)]),
+            vec![false, true, true, false, false]
+        );
+        // Ranges past the end are clamped, not panicking.
+        assert_eq!(ranges_mask(2, &[(1, 9)]), vec![false, true]);
     }
 }
