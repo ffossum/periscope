@@ -35,6 +35,10 @@ const TAB_WIDTH: usize = 4;
 const FILE_GAP: u16 = 1;
 /// Rows scrolled per mouse-wheel notch.
 const MOUSE_SCROLL_LINES: i32 = 3;
+/// Columns scrolled per horizontal-scroll keypress.
+const HSCROLL_COLS: i32 = 4;
+/// Gutter width per cell: a right-aligned line number, a space, and the marker.
+const GUTTER_WIDTH: usize = NUM_WIDTH + 2;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SideKind {
@@ -168,18 +172,27 @@ pub struct DiffViewer {
     files: Vec<FileDiff>,
     palette: Palette,
     scroll: u16,
+    /// Horizontal scroll offset in content columns, shared by both halves.
+    hscroll: u16,
+    /// Longest content line across every cell, used to clamp `hscroll`.
+    max_line_width: u16,
     viewport_height: u16,
+    viewport_width: u16,
 }
 
 impl DiffViewer {
     pub fn new(raw: &str) -> Self {
         let (files, palette) = build_files(parse(raw));
+        let max_line_width = max_line_width(&files);
         Self {
             running: true,
             files,
             palette,
             scroll: 0,
+            hscroll: 0,
+            max_line_width,
             viewport_height: 0,
+            viewport_width: 0,
         }
     }
 
@@ -203,6 +216,7 @@ impl DiffViewer {
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.viewport_height = area.height;
+        self.viewport_width = area.width;
         self.clamp_scroll();
 
         if area.width < 3 || area.height == 0 {
@@ -265,7 +279,7 @@ impl DiffViewer {
             let inner_w = inner.width as usize;
             let lines: Vec<Line> = file.rows[first as usize..last as usize]
                 .iter()
-                .map(|row| render_row(row, inner_w, &self.palette))
+                .map(|row| render_row(row, inner_w, self.hscroll as usize, &self.palette))
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
         }
@@ -280,8 +294,11 @@ impl DiffViewer {
             (_, KeyCode::Char('k') | KeyCode::Up) => self.scroll_by(-1),
             (_, KeyCode::Char('d') | KeyCode::PageDown) => self.scroll_by(page as i32),
             (_, KeyCode::Char('u') | KeyCode::PageUp) => self.scroll_by(-(page as i32)),
+            (_, KeyCode::Char('h') | KeyCode::Left) => self.hscroll_by(-HSCROLL_COLS),
+            (_, KeyCode::Char('l') | KeyCode::Right) => self.hscroll_by(HSCROLL_COLS),
             (_, KeyCode::Char('g') | KeyCode::Home) => self.scroll = 0,
             (_, KeyCode::Char('G') | KeyCode::End) => self.scroll = self.max_scroll(),
+            (_, KeyCode::Char('0')) => self.hscroll = 0,
             _ => {}
         }
     }
@@ -299,8 +316,29 @@ impl DiffViewer {
         self.scroll = next.min(self.max_scroll());
     }
 
+    fn hscroll_by(&mut self, delta: i32) {
+        let next = (self.hscroll as i32 + delta).max(0) as u16;
+        self.hscroll = next.min(self.max_hscroll());
+    }
+
     fn clamp_scroll(&mut self) {
         self.scroll = self.scroll.min(self.max_scroll());
+        self.hscroll = self.hscroll.min(self.max_hscroll());
+    }
+
+    /// Content columns visible in a single cell, given the current viewport.
+    ///
+    /// Mirrors the split in [`render_row`], using the narrower left cell so the
+    /// whole line stays reachable on both sides.
+    fn content_cols(&self) -> usize {
+        let inner_w = (self.viewport_width as usize).saturating_sub(2); // L/R borders
+        let avail = inner_w.saturating_sub(1); // center separator
+        let left_w = avail / 2;
+        left_w.saturating_sub(GUTTER_WIDTH)
+    }
+
+    fn max_hscroll(&self) -> u16 {
+        (self.max_line_width as usize).saturating_sub(self.content_cols()) as u16
     }
 
     fn total_height(&self) -> u16 {
@@ -454,6 +492,26 @@ fn build_files(parsed: Vec<ParsedFile>) -> (Vec<FileDiff>, Palette) {
         .map(|file| build_file(file, &syntaxes, &theme, &palette))
         .collect();
     (files, palette)
+}
+
+/// The longest content line (in chars) across every paired cell, used to clamp
+/// horizontal scrolling. Full-width rows don't scroll, so they're ignored.
+fn max_line_width(files: &[FileDiff]) -> u16 {
+    let side_width = |side: &Option<SideLine>| {
+        side.as_ref()
+            .map(|s| s.segs.iter().map(|seg| seg.text.chars().count()).sum())
+            .unwrap_or(0)
+    };
+    let max = files
+        .iter()
+        .flat_map(|f| &f.rows)
+        .filter_map(|row| match row {
+            Row::Pair { left, right } => Some(side_width(left).max(side_width(right))),
+            Row::Full(..) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    max.min(u16::MAX as usize) as u16
 }
 
 /// Load the syntax-highlighting theme.
@@ -654,7 +712,11 @@ fn mark_intra_line(left: &mut SideLine, right: &mut SideLine) {
 }
 
 /// Render a row to a single full-width `Line`, split into two columns.
-fn render_row(row: &Row, width: usize, p: &Palette) -> Line<'static> {
+///
+/// `hscroll` slides the content of both halves left by that many columns; the
+/// line-number gutters stay fixed. Full-width rows (hunk bands, verbatim text)
+/// are not horizontally scrolled.
+fn render_row(row: &Row, width: usize, hscroll: usize, p: &Palette) -> Line<'static> {
     match row {
         Row::Full(text, style) => Line::from(Span::styled(fit(text, width), *style)),
         Row::Pair { left, right } => {
@@ -663,19 +725,20 @@ fn render_row(row: &Row, width: usize, p: &Palette) -> Line<'static> {
             let left_w = avail / 2;
             let right_w = avail - left_w;
 
-            let mut spans = cell_spans(left.as_ref(), left_w, p);
+            let mut spans = cell_spans(left.as_ref(), left_w, hscroll, p);
             spans.push(Span::styled(
                 "│".to_string(),
                 Style::default().fg(p.separator),
             ));
-            spans.extend(cell_spans(right.as_ref(), right_w, p));
+            spans.extend(cell_spans(right.as_ref(), right_w, hscroll, p));
             Line::from(spans)
         }
     }
 }
 
-/// Build the spans for one side of a pair, fitted to `width`.
-fn cell_spans(side: Option<&SideLine>, width: usize, p: &Palette) -> Vec<Span<'static>> {
+/// Build the spans for one side of a pair, fitted to `width`, with the content
+/// (but not the gutter) scrolled left by `hscroll` columns.
+fn cell_spans(side: Option<&SideLine>, width: usize, hscroll: usize, p: &Palette) -> Vec<Span<'static>> {
     let Some(s) = side else {
         return vec![Span::raw(" ".repeat(width))];
     };
@@ -724,13 +787,16 @@ fn cell_spans(side: Option<&SideLine>, width: usize, p: &Palette) -> Vec<Span<'s
         let mut run_emph = false;
         for ch in seg.text.chars() {
             let e = s.emph.get(ci).copied().unwrap_or(false);
+            ci += 1;
+            if ci <= hscroll {
+                continue; // scrolled off to the left
+            }
             if !run.is_empty() && e != run_emph {
                 let style = if run_emph { lit } else { plain };
                 spans.push(Span::styled(std::mem::take(&mut run), style));
             }
             run.push(ch);
             run_emph = e;
-            ci += 1;
         }
         if !run.is_empty() {
             let style = if run_emph { lit } else { plain };
