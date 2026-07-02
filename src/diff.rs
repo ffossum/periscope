@@ -5,7 +5,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
@@ -91,8 +91,9 @@ impl FileDiff {
 /// UI colors derived from the active syntect theme's settings.
 #[derive(Clone, Copy)]
 struct Palette {
-    /// Default text foreground.
     fg: Color,
+    bg: Color,
+    darker_bg: Color,
     /// Block borders.
     border: Color,
     /// The center separator between the two columns.
@@ -132,19 +133,21 @@ impl Palette {
         // tints in step with light vs dark themes.
         const RED: (u8, u8, u8) = (220, 80, 80);
         const GREEN: (u8, u8, u8) = (90, 190, 110);
-        const BLUE: (u8, u8, u8) = (100, 120, 220);
+        const BLUE: (u8, u8, u8) = (110, 130, 250);
         // Search hits use a fixed yellow/orange standout, dark text on top.
         const YELLOW: (u8, u8, u8) = (224, 198, 92);
         const ORANGE: (u8, u8, u8) = (240, 150, 70);
 
         Self {
             fg: rgb_color(fg),
+            bg: rgb_color(bg),
+            darker_bg: mix(bg, (0, 0, 0), 0.1),
             border: gutter,
             separator: gutter,
             gutter,
             hunk_fg: rgb_color(fg),
             // A subtle band, lighter than the background and tinted blue.
-            hunk_bg: mix(bg, BLUE, 0.18),
+            hunk_bg: mix(bg, BLUE, 0.07),
             removed_bg: mix(bg, RED, 0.14),
             removed_emph_bg: mix(bg, RED, 0.30),
             removed_gutter: rgb_color(RED),
@@ -299,7 +302,7 @@ impl DiffViewer {
 
         let scroll = self.scroll as i32;
         let viewport = area.height as i32;
-        let border_style = Style::default().fg(self.palette.border);
+        let border_style = Style::default().fg(self.palette.border).bg(self.palette.bg);
 
         // Virtual top of the current file in the full stacked layout.
         let mut top = 0i32;
@@ -330,11 +333,14 @@ impl DiffViewer {
                 borders |= Borders::BOTTOM;
             }
 
-            let mut block = Block::default().borders(borders).border_style(border_style);
+            let mut block = Block::default()
+                .borders(borders)
+                .border_style(border_style)
+                .bg(self.palette.darker_bg);
             if borders.contains(Borders::TOP) {
                 block = block.title(Line::from(Span::styled(
                     format!(" {} ", file.title),
-                    Style::default().fg(self.palette.fg),
+                    Style::default().fg(self.palette.fg).bg(self.palette.bg),
                 )));
             }
 
@@ -374,7 +380,7 @@ impl DiffViewer {
             return;
         }
         let row = Rect::new(full.x, full.y + full.height - 1, full.width, 1);
-        let style = Style::default().fg(self.palette.fg);
+        let style = Style::default().fg(self.palette.fg).bg(self.palette.bg);
         if let Some(buf) = &self.input {
             let text = format!("/{buf}");
             let cursor_x = full.x + 1 + buf.chars().count() as u16;
@@ -531,9 +537,7 @@ impl DiffViewer {
                     }
                 }
             }
-            top = top
-                .saturating_add(file.height())
-                .saturating_add(FILE_GAP);
+            top = top.saturating_add(file.height()).saturating_add(FILE_GAP);
         }
         out
     }
@@ -1031,8 +1035,7 @@ fn render_row(
     match row {
         Row::Full(text, style) => {
             let hls = hl.map_or(&[][..], |h| h.full.as_slice());
-            let cur =
-                current.and_then(|(side, s, e)| (side == MatchSide::Full).then_some((s, e)));
+            let cur = current.and_then(|(side, s, e)| (side == MatchSide::Full).then_some((s, e)));
             if hls.is_empty() && cur.is_none() {
                 Line::from(Span::styled(fit(text, width), *style))
             } else {
@@ -1055,7 +1058,7 @@ fn render_row(
             let mut spans = cell_spans(left.as_ref(), left_w, hscroll, lh, lc, p);
             spans.push(Span::styled(
                 "│".to_string(),
-                Style::default().fg(p.separator),
+                Style::default().fg(p.separator).bg(p.bg),
             ));
             spans.extend(cell_spans(right.as_ref(), right_w, hscroll, rh, rc, p));
             Line::from(spans)
@@ -1131,7 +1134,7 @@ fn cell_spans(
     let (bg, emph_bg) = match s.kind {
         SideKind::Removed => (Some(p.removed_bg), Some(p.removed_emph_bg)),
         SideKind::Added => (Some(p.added_bg), Some(p.added_emph_bg)),
-        SideKind::Context => (None, None),
+        SideKind::Context => (Some(p.bg), Some(p.bg)),
     };
     let marker = match s.kind {
         SideKind::Removed => '-',
@@ -1147,7 +1150,7 @@ fn cell_spans(
     // Theme foreground is the default; syntax-colored segs override it below.
     let base = match bg {
         Some(b) => Style::default().fg(p.fg).bg(b),
-        None => Style::default().fg(p.fg),
+        None => Style::default().fg(p.fg).bg(p.bg),
     };
     let emph = emph_bg.map_or(base, |b| base.bg(b));
 
@@ -1378,10 +1381,10 @@ fn parse_hunk_header(line: &str) -> (usize, usize) {
             if let Some(n) = rest.split(',').next().and_then(|n| n.parse().ok()) {
                 old = n;
             }
-        } else if let Some(rest) = token.strip_prefix('+') {
-            if let Some(n) = rest.split(',').next().and_then(|n| n.parse().ok()) {
-                new = n;
-            }
+        } else if let Some(rest) = token.strip_prefix('+')
+            && let Some(n) = rest.split(',').next().and_then(|n| n.parse().ok())
+        {
+            new = n;
         }
     }
     (old, new)
