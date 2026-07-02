@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem};
-use ratatui::Frame;
 
 use crate::app::App;
 
